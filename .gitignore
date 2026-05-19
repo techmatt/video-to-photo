@@ -216,3 +216,42 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Windows OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS OS files (in case of cross-platform contributors)
+.DS_Store
+
+# Claude Code local settings (user-specific; shared settings.json may still be committed)
+.claude/settings.local.json
+
+# Project-specific — pipeline outputs and intermediate artifacts
+data/
+out/
+clusters/
+
+# Source videos should never be committed
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Generated image artifacts (frame stills, cluster grids, thumbnails)
+*.jpg
+*.jpeg
+*.png
+
+# Tabular / index artifacts
+*.parquet
+*.csv
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+
+# Hand-edited identity labels (regenerated per run; treat as local config)
+clusters.yaml
