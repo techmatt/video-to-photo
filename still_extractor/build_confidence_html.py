@@ -6,6 +6,7 @@ Helps identify the threshold below which false-positive face detections dominate
 import base64
 import html
 import io
+import json
 import logging
 from argparse import ArgumentParser
 from pathlib import Path
@@ -22,11 +23,20 @@ FACE_CROP_PADDING = 20
 JPEG_QUALITY = 85
 
 
-def _b64_face_crop(image_path: Path, x1, y1, x2, y2) -> str:
-    img = extract_face_crop(image_path, x1, y1, x2, y2, FACE_CROP_PADDING)
+def _b64_face_crop(image_path: Path, x1, y1, x2, y2, kps=None) -> str:
+    img = extract_face_crop(image_path, x1, y1, x2, y2, FACE_CROP_PADDING, kps=kps)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=JPEG_QUALITY)
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _parse_kps(value) -> list | None:
+    if not isinstance(value, str) or not value or pd.isna(value):
+        return None
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return None
 
 
 def _resolve_frame_for_row(row: pd.Series) -> Path | None:
@@ -157,7 +167,7 @@ def main() -> None:
 
     parquet_subset = parquet_df[[
         "frame_path", "face_det_score", "video_stem", "frame_index",
-        "face_x1", "face_y1", "face_x2", "face_y2",
+        "face_x1", "face_y1", "face_x2", "face_y2", "kps",
     ]]
     scores_subset = scores_df[[
         "frame_path", "refined_frame_path", "composite",
@@ -182,6 +192,7 @@ def main() -> None:
             b64 = _b64_face_crop(
                 img_path,
                 row["face_x1"], row["face_y1"], row["face_x2"], row["face_y2"],
+                kps=_parse_kps(row.get("kps")),
             )
         except Exception as e:
             logger.warning("Failed to crop %s: %s", img_path, e)
