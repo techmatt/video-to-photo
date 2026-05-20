@@ -199,18 +199,17 @@ def dedup_full_frame(df: pd.DataFrame, threshold: int) -> pd.Series:
     return keep
 
 
-def _copy_top_k(
-    df: pd.DataFrame, top_k: int, top_frames_dir: Path,
-) -> int:
+def _copy_selected(df: pd.DataFrame, top_frames_dir: Path) -> int:
+    if top_frames_dir.exists():
+        shutil.rmtree(top_frames_dir)
     top_frames_dir.mkdir(parents=True, exist_ok=True)
-    top = df.head(top_k)
-    for _, row in top.iterrows():
+    for _, row in df.iterrows():
         dest = top_frames_dir / (
             f"{row['composite']:.4f}_{row['video_stem']}_{row['timestamp_s']:.2f}.jpg"
         )
         shutil.copy2(row["frame_path"], dest)
         logger.debug("Copied %s -> %s", row["frame_path"], dest)
-    return len(top)
+    return len(df)
 
 
 def _write_scores_csv(df: pd.DataFrame, csv_path: Path) -> None:
@@ -229,8 +228,10 @@ def main() -> None:
                         help="Parquet file from Pass 1.")
     parser.add_argument("--output-dir", type=Path, default=Path("data"),
                         help="Root output dir; JPEGs go to {output-dir}/top_frames/.")
-    parser.add_argument("--top-k", type=int, default=200,
-                        help="Number of top frames to emit.")
+    parser.add_argument("--top-k-per-file", type=int, default=5,
+                        help="Max frames to select per source file.")
+    parser.add_argument("--top-k-global", type=int, default=0,
+                        help="Optional global cap after per-file selection; 0 = no cap.")
     parser.add_argument("--aesthetics-weight", type=float, default=1.0,
                         help="Composite weight for aesthetics sub-score.")
     parser.add_argument("--face-sharpness-weight", type=float, default=1.0,
@@ -319,10 +320,60 @@ def main() -> None:
     df["dedup_kept"] = df["kept_after_frame_dedup"]
     logger.info("dedup total: %d kept from %d candidates", s3_kept, before)
 
+    per_file_top = (
+        df[df["dedup_kept"]]
+        .sort_values("composite", ascending=False)
+        .groupby("video_stem", sort=False)
+        .head(args.top_k_per_file)
+    )
+    df["top_per_file"] = False
+    df.loc[per_file_top.index, "top_per_file"] = True
+    all_stems = set(df["video_stem"].unique())
+    contributing_stems = set(per_file_top["video_stem"].unique())
+    zero_contrib = len(all_stems - contributing_stems)
+    logger.info(
+        "[SELECTION] Per-file top-%d: %d rows from %d source files (%d files contributed 0)",
+        args.top_k_per_file, len(per_file_top), len(contributing_stems), zero_contrib,
+    )
+
+    per_file_sorted = per_file_top.sort_values("composite", ascending=False)
+    global_dedup_sub = dedup_full_frame(per_file_sorted, args.frame_dedup_threshold)
+    df["global_dedup_kept"] = False
+    df.loc[global_dedup_sub.index, "global_dedup_kept"] = global_dedup_sub.values
+    global_kept = int(df["global_dedup_kept"].sum())
+    logger.info(
+        "[SELECTION] Cross-file dedup: %d rows kept, %d dropped",
+        global_kept, len(per_file_top) - global_kept,
+    )
+
+    df["final_selection"] = df["global_dedup_kept"]
+    if args.top_k_global > 0:
+        capped_idx = (
+            df[df["global_dedup_kept"]]
+            .sort_values("composite", ascending=False)
+            .head(args.top_k_global)
+            .index
+        )
+        df["final_selection"] = False
+        df.loc[capped_idx, "final_selection"] = True
+        logger.info(
+            "[SELECTION] Final selection: %d rows (capped at %d)",
+            int(df["final_selection"].sum()), args.top_k_global,
+        )
+    else:
+        logger.info(
+            "[SELECTION] Final selection: %d rows (no global cap)",
+            int(df["final_selection"].sum()),
+        )
+
     top_frames_dir = args.output_dir / "top_frames"
-    deduped = df[df["dedup_kept"]].reset_index(drop=True)
-    copied = _copy_top_k(deduped, args.top_k, top_frames_dir)
-    logger.info("Copied top %d frames to %s", copied, top_frames_dir)
+    final = (
+        df[df["final_selection"]]
+        .sort_values("composite", ascending=False)
+        .reset_index(drop=True)
+    )
+    copied = _copy_selected(final, top_frames_dir)
+    logger.info("[SELECTION] Copied %d frames to %s", copied, top_frames_dir)
 
     _write_scores_csv(df, args.output_dir / "scores.csv")
 

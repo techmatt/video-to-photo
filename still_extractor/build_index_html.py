@@ -40,6 +40,34 @@ def _pick_frame_column(df: pd.DataFrame) -> str:
     return "frame_path"
 
 
+def _resolve_frame_for_row(
+    row: pd.Series, has_refined: bool, image_root: Path | None,
+) -> tuple[Path | None, str]:
+    """Return (image_path, column_used) with fallback to frame_path.
+
+    If refined_frame_path is missing/unreadable, fall back to frame_path.
+    Returns (None, "") if both are missing/unreadable.
+    """
+    if has_refined:
+        refined = row.get("refined_frame_path", "")
+        if isinstance(refined, str) and refined and not pd.isna(refined):
+            refined_path = _resolve_image_path(refined, image_root)
+            if refined_path.exists():
+                return refined_path, "refined_frame_path"
+        logger.warning(
+            "refined_frame_path missing/unreadable for %s, falling back to frame_path",
+            row.get("video_stem", "?"),
+        )
+
+    raw = row.get("frame_path", "")
+    if not isinstance(raw, str) or not raw or pd.isna(raw):
+        return None, ""
+    fp = _resolve_image_path(raw, image_root)
+    if not fp.exists():
+        return None, ""
+    return fp, "frame_path"
+
+
 def _safe_float(v) -> float | None:
     try:
         f = float(v)
@@ -381,18 +409,18 @@ def main() -> None:
         df = df.sort_values("composite", ascending=False).reset_index(drop=True)
 
     frame_col = _pick_frame_column(df)
-    logger.info("Using image column: %s", frame_col)
+    logger.info("Using image column: %s (with per-row fallback to frame_path)", frame_col)
+    has_refined = frame_col == "refined_frame_path"
 
     cards: list[str] = []
     skipped = 0
     for _, row in tqdm(df.iterrows(), total=len(df), desc="cards"):
-        raw_path = row.get(frame_col)
-        if not isinstance(raw_path, str) or not raw_path:
-            skipped += 1
-            continue
-        img_path = _resolve_image_path(raw_path, args.image_root)
-        if not img_path.exists():
-            logger.warning("Image missing, skipping: %s", img_path)
+        img_path, col_used = _resolve_frame_for_row(row, has_refined, args.image_root)
+        if img_path is None:
+            logger.error(
+                "Both refined_frame_path and frame_path missing/unreadable for %s; skipping",
+                row.get("video_stem", "?"),
+            )
             skipped += 1
             continue
         try:
@@ -404,7 +432,7 @@ def main() -> None:
             logger.warning("Failed to crop %s: %s", img_path, e)
             skipped += 1
             continue
-        cards.append(_build_card(row, b64, frame_col))
+        cards.append(_build_card(row, b64, col_used))
 
     if skipped:
         logger.info("Skipped %d rows with missing/unreadable images", skipped)

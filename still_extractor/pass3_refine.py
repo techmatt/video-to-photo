@@ -12,6 +12,8 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".bmp"}
+
 
 def _face_sharpness_bgr(
     img: np.ndarray, x1: float, y1: float, x2: float, y2: float, padding: int = 10,
@@ -75,6 +77,29 @@ def _refine_candidate(
     row: pd.Series, window_s: float, refined_dir: Path,
 ) -> dict | None:
     video_path = Path(row["video_path"])
+
+    is_image_source = (
+        float(row["timestamp_s"]) == 0.0
+        and int(row["frame_index"]) == 0
+        and video_path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    if is_image_source:
+        logger.info(
+            "[PASSTHROUGH] Image-source row: %s - using frame_path directly",
+            row["video_stem"],
+        )
+        raw_sharp = row.get("sharpness_center", 0.0)
+        original_sharp = (
+            float(raw_sharp) if raw_sharp is not None and not pd.isna(raw_sharp) else 0.0
+        )
+        return {
+            "refined_frame_path": str(Path(row["frame_path"]).resolve()),
+            "refined_timestamp_s": float(row["timestamp_s"]),
+            "refined_sharpness": original_sharp,
+            "original_sharpness": original_sharp,
+            "sharpness_delta": 0.0,
+        }
+
     if not video_path.exists():
         logger.warning("Video not found: %s; skipping", video_path)
         return None
@@ -138,8 +163,6 @@ def main() -> None:
                         help="ffmpeg executable path. Reserved; PyAV uses bundled libs.")
     parser.add_argument("--window-s", type=float, default=0.5,
                         help="Half-window in seconds around candidate timestamp.")
-    parser.add_argument("--top-k", type=int, default=200,
-                        help="How many top candidates to refine (by composite score).")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -159,13 +182,19 @@ def main() -> None:
     df = pd.read_csv(args.scores_csv)
     logger.info("Loaded %d rows from %s", len(df), args.scores_csv)
 
-    if "dedup_kept" not in df.columns:
-        logger.error("scores.csv missing dedup_kept column")
+    if "final_selection" in df.columns:
+        kept = df[df["final_selection"].astype(bool)].copy().reset_index(drop=True)
+        logger.info("Loaded %d final_selection rows from scores.csv", len(kept))
+    elif "dedup_kept" in df.columns:
+        logger.warning(
+            "scores.csv has no final_selection column - falling back to dedup_kept. "
+            "Re-run pass2 to fix.",
+        )
+        kept = df[df["dedup_kept"].astype(bool)].copy().reset_index(drop=True)
+        logger.info("Loaded %d dedup_kept rows from scores.csv (fallback)", len(kept))
+    else:
+        logger.error("scores.csv missing both final_selection and dedup_kept columns")
         return
-
-    kept = df[df["dedup_kept"].astype(bool)].copy()
-    kept = kept.sort_values("composite", ascending=False).head(args.top_k).reset_index(drop=True)
-    logger.info("Refining top %d candidates (post-dedup)", len(kept))
 
     refined_dir = args.output_dir / "refined"
     refined_dir.mkdir(parents=True, exist_ok=True)
