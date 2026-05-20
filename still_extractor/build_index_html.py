@@ -216,12 +216,24 @@ function restoreLabels() {
 }
 
 function updateSummary() {
-  const counts = { good: 0, okay: 0, bad: 0, none: 0, unreviewed: 0 };
+  const counts = { none: 0, bad: 0, okay: 0, good: 0, unreviewed: 0 };
   const cards = document.querySelectorAll('.card');
   cards.forEach(card => {
-    const lbl = getLabel(card);
-    if (lbl) counts[lbl]++;
-    else counts.unreviewed++;
+    const filename = card.dataset.filename;
+    const label = localStorage.getItem(filename);
+    if (label === null || label === undefined || label === '') {
+      counts.unreviewed++;
+    } else if (label === 'none') {
+      counts.none++;
+    } else if (label === 'bad') {
+      counts.bad++;
+    } else if (label === 'okay') {
+      counts.okay++;
+    } else if (label === 'good') {
+      counts.good++;
+    } else {
+      counts.unreviewed++;
+    }
   });
   console.log('Label counts:', counts, 'cards:', cards.length);
   document.getElementById('summary').textContent =
@@ -368,14 +380,15 @@ document.addEventListener('DOMContentLoaded', () => {
 def _build_card(row: pd.Series, b64: str, frame_col: str) -> str:
     frame_path = str(row[frame_col])
     fp = Path(frame_path)
-    card_key = fp.name
+    stem_raw = str(row.get("video_stem", ""))
+    card_key = f"{stem_raw}/{fp.name}" if stem_raw else fp.name
     href = html.escape(frame_path)
     composite = _safe_float(row.get("composite"))
     aes = _safe_float(row.get("aesthetics_norm"))
     fs = _safe_float(row.get("face_sharpness_norm"))
     eye = _safe_float(row.get("eye_norm"))
     ts = _safe_float(row.get("refined_timestamp_s")) or _safe_float(row.get("timestamp_s"))
-    video_stem = html.escape(str(row.get("video_stem", "")))
+    video_stem = html.escape(stem_raw)
 
     composite_str = f"{composite:.4f}" if composite is not None else "—"
     aes_str = f"{aes:.3f}" if aes is not None else "—"
