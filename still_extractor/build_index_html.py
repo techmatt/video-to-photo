@@ -120,6 +120,7 @@ header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; }
 .toolbar button:hover { background: #2a2a2a; }
 .toolbar button.active { background: #3a5fb0; border-color: #4a7fd0; }
 .toolbar .summary { margin-left: auto; color: #aaa; font-size: 12px; }
+.toolbar .toolbar-label { color: #888; font-size: 12px; margin-right: 4px; }
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -163,6 +164,11 @@ header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; }
 }
 .card .meta .composite { color: #fff; font-weight: 600; font-size: 13px; }
 .card .meta .sub { color: #888; }
+.card .meta .pred { font-weight: 600; }
+.card .meta .pred.pred-none { color: #8B0000; }
+.card .meta .pred.pred-bad { color: #FF1111; }
+.card .meta .pred.pred-okay { color: #F59E0B; }
+.card .meta .pred.pred-good { color: #22C55E; }
 .card .actions { margin-top: 6px; display: flex; gap: 6px; }
 .card .actions button {
   flex: 1;
@@ -195,14 +201,27 @@ header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; }
 
 JS = """
 const VALID_LABELS = ['good', 'okay', 'bad', 'none'];
+const UNCERTAIN_THRESHOLD = 0.5;
 
 let currentFilter = 'all';
+let currentPredFilter = 'all';
+let currentSort = 'composite';
 let activeCard = null;
 let userHasHovered = false;
 
 function getLabel(card) {
   const v = localStorage.getItem(card.dataset.filename);
   return VALID_LABELS.includes(v) ? v : null;
+}
+
+function getPredLabel(card) {
+  const v = card.dataset.predLabel;
+  return VALID_LABELS.includes(v) ? v : null;
+}
+
+function getPredConfidence(card) {
+  const v = parseFloat(card.dataset.predConfidence);
+  return isNaN(v) ? null : v;
 }
 
 function applyLabel(card, label) {
@@ -226,6 +245,7 @@ function restoreLabels() {
 
 function updateSummary() {
   const counts = { none: 0, bad: 0, okay: 0, good: 0, unreviewed: 0 };
+  const predCounts = { none: 0, bad: 0, okay: 0, good: 0, uncertain: 0 };
   const cards = document.querySelectorAll('.card');
   cards.forEach(card => {
     const filename = card.dataset.filename;
@@ -243,22 +263,49 @@ function updateSummary() {
     } else {
       counts.unreviewed++;
     }
+    if (HAS_PRED) {
+      const pl = getPredLabel(card);
+      const pc = getPredConfidence(card);
+      if (pl && pc !== null && pc < UNCERTAIN_THRESHOLD) {
+        predCounts.uncertain++;
+      } else if (pl) {
+        predCounts[pl]++;
+      }
+    }
   });
   console.log('Label counts:', counts, 'cards:', cards.length);
-  document.getElementById('summary').textContent =
+  let summary =
     `${counts.none} none · ${counts.bad} bad · ${counts.okay} okay · ${counts.good} good · ${counts.unreviewed} unreviewed · ${cards.length} total`;
+  if (HAS_PRED) {
+    summary += ` | pred: ${predCounts.none} none · ${predCounts.bad} bad · ${predCounts.okay} okay · ${predCounts.good} good · ${predCounts.uncertain} uncertain`;
+  }
+  document.getElementById('summary').textContent = summary;
+}
+
+function passesGtFilter(card) {
+  const lbl = getLabel(card);
+  if (currentFilter === 'all') return true;
+  if (currentFilter === 'good') return lbl === 'good';
+  if (currentFilter === 'okay') return lbl === 'okay';
+  if (currentFilter === 'bad') return lbl === 'bad';
+  if (currentFilter === 'none') return lbl === 'none';
+  if (currentFilter === 'unreviewed') return !lbl;
+  return true;
+}
+
+function passesPredFilter(card) {
+  if (!HAS_PRED || currentPredFilter === 'all') return true;
+  const pl = getPredLabel(card);
+  const pc = getPredConfidence(card);
+  if (currentPredFilter === 'uncertain') {
+    return pl !== null && pc !== null && pc < UNCERTAIN_THRESHOLD;
+  }
+  return pl === currentPredFilter;
 }
 
 function applyFilter() {
   document.querySelectorAll('.card').forEach(card => {
-    const lbl = getLabel(card);
-    let show = true;
-    if (currentFilter === 'good') show = lbl === 'good';
-    else if (currentFilter === 'okay') show = lbl === 'okay';
-    else if (currentFilter === 'bad') show = lbl === 'bad';
-    else if (currentFilter === 'none') show = lbl === 'none';
-    else if (currentFilter === 'unreviewed') show = !lbl;
-    card.style.display = show ? '' : 'none';
+    card.style.display = (passesGtFilter(card) && passesPredFilter(card)) ? '' : 'none';
   });
 }
 
@@ -268,6 +315,41 @@ function setFilter(f) {
     b.classList.toggle('active', b.dataset.filter === f);
   });
   applyFilter();
+}
+
+function setPredFilter(f) {
+  currentPredFilter = f;
+  document.querySelectorAll('.pred-filter-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.predFilter === f);
+  });
+  applyFilter();
+}
+
+function sortCards(mode) {
+  currentSort = mode;
+  const grid = document.querySelector('.grid');
+  const cards = Array.from(grid.querySelectorAll('.card'));
+  if (mode === 'confidence') {
+    cards.sort((a, b) => {
+      const ca = parseFloat(a.dataset.predConfidence);
+      const cb = parseFloat(b.dataset.predConfidence);
+      const va = isNaN(ca) ? -Infinity : ca;
+      const vb = isNaN(cb) ? -Infinity : cb;
+      return vb - va;
+    });
+  } else {
+    cards.sort((a, b) => {
+      const ca = parseFloat(a.dataset.composite);
+      const cb = parseFloat(b.dataset.composite);
+      const va = isNaN(ca) ? -Infinity : ca;
+      const vb = isNaN(cb) ? -Infinity : cb;
+      return vb - va;
+    });
+  }
+  cards.forEach(c => grid.appendChild(c));
+  document.querySelectorAll('.sort-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.sort === mode);
+  });
 }
 
 function exportLabels() {
@@ -357,6 +439,12 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.filter-btn').forEach(b => {
     b.addEventListener('click', () => setFilter(b.dataset.filter));
   });
+  document.querySelectorAll('.pred-filter-btn').forEach(b => {
+    b.addEventListener('click', () => setPredFilter(b.dataset.predFilter));
+  });
+  document.querySelectorAll('.sort-btn').forEach(b => {
+    b.addEventListener('click', () => sortCards(b.dataset.sort));
+  });
   document.getElementById('export-btn').addEventListener('click', exportLabels);
   document.querySelectorAll('.none-btn').forEach(b => {
     b.addEventListener('click', e => {
@@ -400,18 +488,36 @@ def _build_card(row: pd.Series, b64: str, frame_col: str) -> str:
     video_stem = html.escape(stem_raw)
 
     composite_str = f"{composite:.4f}" if composite is not None else "—"
+    composite_attr = f"{composite:.6f}" if composite is not None else ""
     aes_str = f"{aes:.3f}" if aes is not None else "—"
     fs_str = f"{fs:.3f}" if fs is not None else "—"
     eye_str = f"{eye:.3f}" if eye is not None else "—"
     ts_str = f"{ts:.3f}s" if ts is not None else "—"
 
-    return f"""<div class="card" tabindex="0" data-filename="{html.escape(card_key)}">
+    pred_raw = row.get("pred_label")
+    pred_label = (
+        pred_raw
+        if isinstance(pred_raw, str) and pred_raw and not pd.isna(pred_raw)
+        else None
+    )
+    pred_conf = _safe_float(row.get("pred_confidence"))
+    pred_label_attr = html.escape(pred_label) if pred_label else ""
+    pred_conf_attr = f"{pred_conf:.6f}" if pred_conf is not None else ""
+    if pred_label and pred_conf is not None:
+        pred_line = (
+            f'    <div class="pred pred-{html.escape(pred_label)}">'
+            f"pred: {html.escape(pred_label)} ({pred_conf:.2f})</div>\n"
+        )
+    else:
+        pred_line = ""
+
+    return f"""<div class="card" tabindex="0" data-filename="{html.escape(card_key)}" data-composite="{composite_attr}" data-pred-label="{pred_label_attr}" data-pred-confidence="{pred_conf_attr}">
   <a href="{href}" target="_blank"><img src="data:image/jpeg;base64,{b64}" alt=""></a>
   <div class="meta">
     <div class="composite">{composite_str}</div>
     <div>{video_stem} @ {ts_str}</div>
     <div class="sub">aes {aes_str} · face {fs_str} · eye {eye_str}</div>
-  </div>
+{pred_line}  </div>
   <div class="actions">
     <button class="none-btn">None (1)</button>
     <button class="bad-btn">Bad (2)</button>
@@ -431,6 +537,10 @@ def main() -> None:
                         help="Path to write the HTML file.")
     parser.add_argument("--image-root", type=Path, default=None,
                         help="Root directory for resolving relative image paths.")
+    parser.add_argument("--inference-csv", type=Path, default=None,
+                        help="Path to inference_scores.csv from train_classifier.py "
+                             "(optional). If provided, classifier predictions are joined "
+                             "in and shown on each card with sort/filter controls.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -447,6 +557,23 @@ def main() -> None:
     if "dedup_kept" in df.columns:
         df = df[df["dedup_kept"].astype(bool)].copy()
         logger.info("Filtered to %d dedup-kept rows", len(df))
+
+    has_pred = False
+    if args.inference_csv is not None:
+        inf_df = pd.read_csv(args.inference_csv)
+        keep_cols = [
+            "frame_path", "pred_label", "pred_confidence",
+            "p_none_tta", "p_bad_tta", "p_okay_tta", "p_good_tta",
+        ]
+        inf_df = inf_df[[c for c in keep_cols if c in inf_df.columns]]
+        before = len(df)
+        df = df.merge(inf_df, on="frame_path", how="left")
+        matched = int(df["pred_label"].notna().sum()) if "pred_label" in df.columns else 0
+        logger.info(
+            "Joined inference CSV %s: %d/%d rows matched a prediction",
+            args.inference_csv, matched, before,
+        )
+        has_pred = "pred_label" in df.columns
 
     if "composite" in df.columns:
         df = df.sort_values("composite", ascending=False).reset_index(drop=True)
@@ -481,6 +608,30 @@ def main() -> None:
     if skipped:
         logger.info("Skipped %d rows with missing/unreadable images", skipped)
 
+    if has_pred:
+        sort_row = """  <div class="toolbar">
+    <span class="toolbar-label">Sort by:</span>
+    <button class="sort-btn active" data-sort="composite">Composite</button>
+    <button class="sort-btn" data-sort="confidence">Pred Confidence ↓</button>
+  </div>
+"""
+        pred_row = """  <div class="toolbar">
+    <span class="toolbar-label">Pred:</span>
+    <button class="pred-filter-btn active" data-pred-filter="all">All</button>
+    <button class="pred-filter-btn" data-pred-filter="none">None</button>
+    <button class="pred-filter-btn" data-pred-filter="bad">Bad</button>
+    <button class="pred-filter-btn" data-pred-filter="okay">Okay</button>
+    <button class="pred-filter-btn" data-pred-filter="good">Good</button>
+    <button class="pred-filter-btn" data-pred-filter="uncertain">Uncertain</button>
+  </div>
+"""
+    else:
+        sort_row = ""
+        pred_row = ""
+
+    has_pred_js = "true" if has_pred else "false"
+    js_block = f"const HAS_PRED = {has_pred_js};\n{JS}"
+
     html_doc = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -501,14 +652,14 @@ def main() -> None:
     <button id="export-btn">Export Labels</button>
     <span class="summary" id="summary"></span>
   </div>
-  <div class="legend">
+{sort_row}{pred_row}  <div class="legend">
     Shortcuts: <kbd>1</kbd>/<kbd>N</kbd> None &middot; <kbd>2</kbd>/<kbd>B</kbd> Bad &middot; <kbd>3</kbd>/<kbd>O</kbd> Okay &middot; <kbd>4</kbd>/<kbd>G</kbd> Good &middot; <kbd>X</kbd> Clear &middot; <kbd>&larr;</kbd><kbd>&rarr;</kbd> Navigate
   </div>
 </header>
 <div class="grid">
 {chr(10).join(cards)}
 </div>
-<script>{JS}</script>
+<script>{js_block}</script>
 </body>
 </html>
 """
