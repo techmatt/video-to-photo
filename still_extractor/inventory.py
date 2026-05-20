@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import random
+import statistics
 import sys
 from argparse import ArgumentParser
 from collections import defaultdict
@@ -154,14 +155,28 @@ def write_manifest(manifest_path: Path, rows: list[dict]) -> None:
             writer.writerow(row)
 
 
+def _format_bytes(n: int) -> str:
+    for unit, threshold in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if n >= threshold:
+            v = n / threshold
+            return f"{v:.1f} {unit}" if v < 10 else f"{int(round(v))} {unit}"
+    return f"{n} B"
+
+
+def _to_bool_str(v) -> str:
+    if isinstance(v, str):
+        return "True" if v == "True" else "False"
+    return "True" if v else "False"
+
+
 def _serialize_row(row: dict) -> dict:
     out = dict(row)
     if out.get("duration_s") is None:
         out["duration_s"] = ""
     if out.get("sample_windows_s") is None:
         out["sample_windows_s"] = ""
-    out["is_duplicate"] = "True" if out["is_duplicate"] else "False"
-    out["is_long_video"] = "True" if out["is_long_video"] else "False"
+    out["is_duplicate"] = _to_bool_str(out["is_duplicate"])
+    out["is_long_video"] = _to_bool_str(out["is_long_video"])
     return out
 
 
@@ -231,7 +246,9 @@ def main() -> None:
 
     if not new_paths:
         print("Nothing new to process.")
-        write_manifest(manifest_path, [_serialize_row(r) for r in existing_rows])
+        rows_out = [_serialize_row(r) for r in existing_rows]
+        rows_out.sort(key=lambda r: int(r["size_bytes"]))
+        write_manifest(manifest_path, rows_out)
         return
 
     new_paths.sort(key=lambda p: str(p))
@@ -365,6 +382,7 @@ def main() -> None:
         })
 
     all_rows = existing_rows + [_serialize_row(r) for r in new_rows]
+    all_rows.sort(key=lambda r: int(r["size_bytes"]))
     write_manifest(manifest_path, all_rows)
 
     def _not_dup(r: dict) -> bool:
@@ -389,6 +407,13 @@ def main() -> None:
         f"({n_images_unique} images, {n_videos_unique} videos — {n_dup_total} duplicates skipped)"
     )
     print(f"Long videos: {n_long_windowed} windowed, {n_short_full} processed in full")
+    sizes_all = [int(r["size_bytes"]) for r in all_rows]
+    if sizes_all:
+        median_size = int(statistics.median(sizes_all))
+        print(
+            f"File size range: {_format_bytes(min(sizes_all))} → "
+            f"{_format_bytes(max(sizes_all))} (median {_format_bytes(median_size)})"
+        )
     print("───────────────────────────────────────")
 
 
