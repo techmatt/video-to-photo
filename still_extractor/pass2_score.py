@@ -15,6 +15,8 @@ from aesthetic_predictor_v2_5 import convert_v2_5_from_siglip
 from PIL import Image
 from tqdm import tqdm
 
+from still_extractor.face_crop import extract_face_crop
+
 logger = logging.getLogger(__name__)
 
 AESTHETICS_BATCH_SIZE = 32
@@ -151,24 +153,50 @@ def _composite(
     return weighted.rename("composite")
 
 
-def _dedup(df: pd.DataFrame, threshold: int) -> pd.Series:
-    """Return a bool Series aligned with df marking which rows survived dedup."""
+def dedup_temporal(df: pd.DataFrame, window_s: float) -> pd.Series:
+    """Greedy temporal dedup within each video. True = keep."""
+    keep = pd.Series(False, index=df.index)
+    for _, group in df.groupby("video_path", sort=False):
+        sorted_group = group.sort_values("composite", ascending=False)
+        kept_times: list[float] = []
+        for idx, row in sorted_group.iterrows():
+            ts = float(row["timestamp_s"])
+            if any(abs(ts - kt) < window_s for kt in kept_times):
+                continue
+            kept_times.append(ts)
+            keep.loc[idx] = True
+    return keep
+
+
+def dedup_face_crop(df: pd.DataFrame, threshold: int) -> pd.Series:
+    """Dedup by face-crop dHash, iterating in df order. True = keep."""
+    keep = pd.Series(False, index=df.index)
     kept_hashes: list[imagehash.ImageHash] = []
-    kept_mask = pd.Series(False, index=df.index)
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="dedup"):
-        try:
-            phash = imagehash.dhash(Image.open(row["frame_path"]), hash_size=8)
-        except Exception as e:
-            logger.warning("Failed to hash %s: %s", row["frame_path"], e)
-            continue
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="dedup-face"):
+        crop = extract_face_crop(
+            Path(row["frame_path"]),
+            row["face_x1"], row["face_y1"], row["face_x2"], row["face_y2"],
+            padding=20,
+        )
+        phash = imagehash.dhash(crop, hash_size=8)
         if any((phash - kept) <= threshold for kept in kept_hashes):
-            logger.debug(
-                "DROP-dup %s composite=%.4f", row["frame_path"], row["composite"],
-            )
             continue
         kept_hashes.append(phash)
-        kept_mask.loc[idx] = True
-    return kept_mask
+        keep.loc[idx] = True
+    return keep
+
+
+def dedup_full_frame(df: pd.DataFrame, threshold: int) -> pd.Series:
+    """Dedup by full-frame dHash, iterating in df order. True = keep."""
+    keep = pd.Series(False, index=df.index)
+    kept_hashes: list[imagehash.ImageHash] = []
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="dedup-frame"):
+        phash = imagehash.dhash(Image.open(row["frame_path"]), hash_size=8)
+        if any((phash - kept) <= threshold for kept in kept_hashes):
+            continue
+        kept_hashes.append(phash)
+        keep.loc[idx] = True
+    return keep
 
 
 def _copy_top_k(
@@ -209,11 +237,23 @@ def main() -> None:
                         help="Composite weight for face sharpness sub-score.")
     parser.add_argument("--eye-weight", type=float, default=0.5,
                         help="Composite weight for eye-openness sub-score.")
-    parser.add_argument("--dedup-threshold", type=int, default=8,
-                        help="dHash Hamming distance threshold; below = duplicate.")
+    parser.add_argument("--temporal-window-s", type=float, default=2.0,
+                        help="Seconds: same-video frames within this window are temporal duplicates.")
+    parser.add_argument("--face-dedup-threshold", type=int, default=8,
+                        help="dHash Hamming distance threshold for face-crop dedup; <= is duplicate.")
+    parser.add_argument("--frame-dedup-threshold", type=int, default=8,
+                        help="dHash Hamming distance threshold for full-frame dedup; <= is duplicate.")
+    parser.add_argument("--dedup-threshold", type=int, default=None,
+                        help="DEPRECATED: alias for --frame-dedup-threshold.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
+
+    if args.dedup_threshold is not None:
+        logger.warning(
+            "--dedup-threshold is deprecated; use --frame-dedup-threshold instead.",
+        )
+        args.frame_dedup_threshold = args.dedup_threshold
 
     logging.basicConfig(
         level=args.log_level,
@@ -245,10 +285,39 @@ def main() -> None:
     df = df.sort_values("composite", ascending=False).reset_index(drop=True)
 
     before = len(df)
-    kept_mask = _dedup(df, args.dedup_threshold)
-    df["dedup_kept"] = kept_mask.values
-    after = int(kept_mask.sum())
-    logger.info("Dedup: %d -> %d (dropped %d)", before, after, before - after)
+
+    temporal_mask = dedup_temporal(df, args.temporal_window_s)
+    df["kept_after_temporal"] = temporal_mask
+    s1_kept = int(temporal_mask.sum())
+    logger.info(
+        "dedup stage 1 (temporal): %d kept, %d dropped",
+        s1_kept, before - s1_kept,
+    )
+
+    s1_survivors = df[df["kept_after_temporal"]]
+    face_mask_sub = dedup_face_crop(s1_survivors, args.face_dedup_threshold)
+    face_mask = pd.Series(False, index=df.index)
+    face_mask.loc[face_mask_sub.index] = face_mask_sub
+    df["kept_after_face_dedup"] = face_mask
+    s2_kept = int(face_mask.sum())
+    logger.info(
+        "dedup stage 2 (face crop): %d kept, %d dropped",
+        s2_kept, s1_kept - s2_kept,
+    )
+
+    s2_survivors = df[df["kept_after_face_dedup"]]
+    frame_mask_sub = dedup_full_frame(s2_survivors, args.frame_dedup_threshold)
+    frame_mask = pd.Series(False, index=df.index)
+    frame_mask.loc[frame_mask_sub.index] = frame_mask_sub
+    df["kept_after_frame_dedup"] = frame_mask
+    s3_kept = int(frame_mask.sum())
+    logger.info(
+        "dedup stage 3 (full frame): %d kept, %d dropped",
+        s3_kept, s2_kept - s3_kept,
+    )
+
+    df["dedup_kept"] = df["kept_after_frame_dedup"]
+    logger.info("dedup total: %d kept from %d candidates", s3_kept, before)
 
     top_frames_dir = args.output_dir / "top_frames"
     deduped = df[df["dedup_kept"]].reset_index(drop=True)
