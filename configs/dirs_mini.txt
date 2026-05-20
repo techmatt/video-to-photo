@@ -1,0 +1,4 @@
+# One directory per line. Lines starting with `#` and blank lines are ignored.
+# Edit paths to point at your own source directories.
+example_assets
+D:\Julia Photos\Julia Pictures April 1 2025 Old

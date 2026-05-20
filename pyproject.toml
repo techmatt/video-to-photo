@@ -19,6 +19,8 @@ dependencies = [
     "scikit-learn",
     "hdbscan",
     "Pillow",
+    "pillow-heif",
+    "pyyaml",
     "tqdm",
 ]
 
