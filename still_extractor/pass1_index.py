@@ -1,5 +1,6 @@
 """Pass 1: walk source videos and index candidate frames."""
 
+import json
 import logging
 import time
 from argparse import ArgumentParser
@@ -9,11 +10,30 @@ from pathlib import Path
 import av
 import cv2
 import numpy as np
+import pandas as pd
+from insightface.app import FaceAnalysis
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv"}
+
+# Module-level FaceAnalysis used by worker processes (set via pool initializer).
+_face_app: FaceAnalysis | None = None
+
+
+def _create_face_app() -> FaceAnalysis:
+    app = FaceAnalysis(
+        name="buffalo_l",
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    app.prepare(ctx_id=0, det_size=(640, 640))
+    return app
+
+
+def _worker_init() -> None:
+    global _face_app
+    _face_app = _create_face_app()
 
 
 def find_videos(video_dir: Path) -> list[Path]:
@@ -101,13 +121,28 @@ def sample_frames(video_path: Path, fps: float):
         container.close()
 
 
+def _bbox_width(bbox: np.ndarray) -> float:
+    return float(bbox[2] - bbox[0])
+
+
+def _bbox_area(bbox: np.ndarray) -> float:
+    return float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+
+
 def process_video(
     video_path: Path,
     output_dir: Path,
     fps: float,
     sharpness_threshold: float,
-) -> dict[str, int | float | str]:
-    """Process one video, returning a stats dict."""
+    min_face_px: float,
+    face_app: FaceAnalysis | None = None,
+) -> tuple[dict[str, int | float | str], list[dict]]:
+    """Process one video, returning (stats, rows)."""
+    if face_app is None:
+        face_app = _face_app
+    if face_app is None:
+        raise RuntimeError("FaceAnalysis app not initialized in this process")
+
     frames_dir = output_dir / "frames" / video_path.stem
 
     if frames_dir.exists() and any(frames_dir.iterdir()):
@@ -116,53 +151,126 @@ def process_video(
             "video": str(video_path),
             "frames_sampled": 0,
             "frames_kept": 0,
+            "faces_found": 0,
             "elapsed_seconds": 0.0,
             "skipped": 1,
-        }
+        }, []
 
     frames_dir.mkdir(parents=True, exist_ok=True)
 
     start = time.monotonic()
     frames_sampled = 0
     frames_kept = 0
+    faces_found = 0
+    rows: list[dict] = []
+    video_abs = str(video_path.resolve())
 
     try:
         for frame_index, timestamp_sec, img in sample_frames(video_path, fps):
             frames_sampled += 1
             score = sharpness_score(img)
-            keep = score >= sharpness_threshold
-            logger.debug(
-                "%s frame=%d t=%.3fs sharpness=%.2f %s",
-                video_path.name, frame_index, timestamp_sec, score,
-                "KEEP" if keep else "DROP",
-            )
-            if not keep:
+            if score < sharpness_threshold:
+                logger.debug(
+                    "%s frame=%d t=%.3fs sharpness=%.2f DROP-sharpness",
+                    video_path.name, frame_index, timestamp_sec, score,
+                )
                 continue
+
+            try:
+                faces = face_app.get(img)
+            except Exception as e:
+                logger.warning(
+                    "InsightFace failed on %s frame=%d: %s",
+                    video_path.name, frame_index, e,
+                )
+                continue
+
+            qualifying = [f for f in faces if _bbox_width(f.bbox) >= min_face_px]
+            if not qualifying:
+                logger.debug(
+                    "%s frame=%d t=%.3fs sharpness=%.2f DROP-no-face",
+                    video_path.name, frame_index, timestamp_sec, score,
+                )
+                continue
+
+            largest = max(qualifying, key=lambda f: _bbox_area(f.bbox))
+
             out_path = frames_dir / f"{frame_index:06d}_{timestamp_sec:.3f}.jpg"
             cv2.imwrite(str(out_path), img)
             frames_kept += 1
+            faces_found += 1
+
+            h, w = img.shape[:2]
+            bbox = largest.bbox
+            kps = largest.kps
+            embedding = largest.normed_embedding
+
+            rows.append({
+                "video_path": video_abs,
+                "video_stem": video_path.stem,
+                "frame_index": int(frame_index),
+                "timestamp_s": float(timestamp_sec),
+                "frame_path": str(out_path.resolve()),
+                "frame_w": int(w),
+                "frame_h": int(h),
+                "sharpness_center": score,
+                "face_x1": float(bbox[0]),
+                "face_y1": float(bbox[1]),
+                "face_x2": float(bbox[2]),
+                "face_y2": float(bbox[3]),
+                "face_w": float(bbox[2] - bbox[0]),
+                "face_det_score": float(largest.det_score),
+                "kps": json.dumps([[float(x), float(y)] for x, y in kps]),
+                "embedding": json.dumps([float(v) for v in embedding]),
+            })
+
+            logger.debug(
+                "%s frame=%d t=%.3fs sharpness=%.2f KEEP faces=%d largest_w=%.1f",
+                video_path.name, frame_index, timestamp_sec, score,
+                len(qualifying), _bbox_width(bbox),
+            )
     except Exception as e:
         logger.warning("Failed to process %s: %s", video_path, e)
 
     elapsed = time.monotonic() - start
     logger.info(
-        "%s: sampled=%d kept=%d elapsed=%.1fs",
-        video_path.name, frames_sampled, frames_kept, elapsed,
+        "%s: sampled=%d kept=%d faces=%d elapsed=%.1fs",
+        video_path.name, frames_sampled, frames_kept, faces_found, elapsed,
     )
     return {
         "video": str(video_path),
         "frames_sampled": frames_sampled,
         "frames_kept": frames_kept,
+        "faces_found": faces_found,
         "elapsed_seconds": elapsed,
         "skipped": 0,
-    }
+    }, rows
+
+
+def _write_index(
+    index_file: Path,
+    existing_df: pd.DataFrame | None,
+    new_rows: list[dict],
+) -> int:
+    if not new_rows and existing_df is None:
+        logger.info("No rows to write to %s", index_file)
+        return 0
+
+    new_df = pd.DataFrame(new_rows) if new_rows else pd.DataFrame()
+    if existing_df is not None and not existing_df.empty:
+        combined = pd.concat([existing_df, new_df], ignore_index=True)
+    else:
+        combined = new_df
+
+    if "frame_path" in combined.columns:
+        combined = combined.drop_duplicates(subset=["frame_path"], keep="last")
+
+    index_file.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(index_file, index=False)
+    return len(combined)
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
     parser = ArgumentParser(description="Walk source videos and index candidate frames.")
     parser.add_argument("--video-dir", type=Path, required=True,
                         help="Directory to scan recursively for videos.")
@@ -174,12 +282,30 @@ def main() -> None:
                         help="Sample rate in frames per second.")
     parser.add_argument("--sharpness-threshold", type=float, default=100.0,
                         help="Laplacian variance threshold; frames below this are dropped.")
+    parser.add_argument("--min-face-px", type=float, default=80.0,
+                        help="Minimum face bounding box width in pixels; faces below this are dropped.")
+    parser.add_argument("--index-file", type=Path, default=Path("data/index.parquet"),
+                        help="Output Parquet file for per-frame index rows.")
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of parallel video workers.")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Logging verbosity. DEBUG prints per-frame keep/drop decisions.")
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=args.log_level,
+        format="%(asctime)s %(levelname)s %(message)s",
+        force=True,
+    )
 
     if args.ffmpeg_path != "ffmpeg":
         logger.debug("--ffmpeg-path=%s provided but unused (PyAV uses bundled libs)", args.ffmpeg_path)
+
+    existing_df: pd.DataFrame | None = None
+    if args.index_file.exists():
+        existing_df = pd.read_parquet(args.index_file)
+        logger.info("Resume: %s already has %d rows", args.index_file, len(existing_df))
 
     videos = find_videos(args.video_dir)
     if not videos:
@@ -191,40 +317,54 @@ def main() -> None:
 
     total_sampled = 0
     total_kept = 0
+    total_faces = 0
     total_skipped = 0
+    all_rows: list[dict] = []
 
     if args.workers > 1:
-        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        with ProcessPoolExecutor(max_workers=args.workers, initializer=_worker_init) as pool:
             futures = {
                 pool.submit(
-                    process_video, v, args.output_dir, args.fps, args.sharpness_threshold,
+                    process_video,
+                    v, args.output_dir, args.fps, args.sharpness_threshold, args.min_face_px,
                 ): v for v in videos
             }
             for future in tqdm(as_completed(futures), total=len(futures), desc="videos"):
                 v = futures[future]
                 try:
-                    stats = future.result()
+                    stats, rows = future.result()
                 except Exception:
                     logger.exception("Worker failed for %s", v)
                     continue
                 total_sampled += int(stats["frames_sampled"])
                 total_kept += int(stats["frames_kept"])
+                total_faces += int(stats["faces_found"])
                 total_skipped += int(stats["skipped"])
+                all_rows.extend(rows)
     else:
+        face_app = _create_face_app()
         for v in tqdm(videos, desc="videos"):
             try:
-                stats = process_video(v, args.output_dir, args.fps, args.sharpness_threshold)
+                stats, rows = process_video(
+                    v, args.output_dir, args.fps, args.sharpness_threshold,
+                    args.min_face_px, face_app,
+                )
             except Exception:
                 logger.exception("Failed processing %s", v)
                 continue
             total_sampled += int(stats["frames_sampled"])
             total_kept += int(stats["frames_kept"])
+            total_faces += int(stats["faces_found"])
             total_skipped += int(stats["skipped"])
+            all_rows.extend(rows)
+
+    total_index_rows = _write_index(args.index_file, existing_df, all_rows)
 
     logger.info(
-        "Summary: videos=%d sampled=%d kept=%d skipped=%d",
-        len(videos), total_sampled, total_kept, total_skipped,
+        "Summary: videos=%d sampled=%d kept=%d faces=%d skipped=%d index_rows=%d",
+        len(videos), total_sampled, total_kept, total_faces, total_skipped, total_index_rows,
     )
+    logger.info("Wrote %d total rows to %s", total_index_rows, args.index_file)
 
 
 if __name__ == "__main__":
