@@ -411,8 +411,8 @@ def process_image(
     largest = max(qualifying, key=lambda f: _bbox_area(f.bbox))
 
     frames_dir = output_dir / "frames" / image_path.stem
-    frames_dir.mkdir(parents=True, exist_ok=True)
     out_path = frames_dir / "00000_0.000.jpg"
+    frames_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out_path), img)
     stats.frames_written += 1
 

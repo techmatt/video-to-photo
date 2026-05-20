@@ -90,15 +90,16 @@ header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; }
 }
 .card {
   background: #1a1a1a;
-  border: 2px solid #2a2a2a;
+  border: 2px solid transparent;
   border-radius: 6px;
   padding: 8px;
   outline: none;
   transition: border-color 0.15s, opacity 0.15s;
 }
 .card:focus { border-color: #5a8fe0; }
-.card.good { border-color: #3a9a3a; }
-.card.bad { border-color: #a04040; opacity: 0.55; }
+.card.good { border-color: #55bb55; }
+.card.okay { border-color: #e0a030; }
+.card.bad { border-color: #e05555; opacity: 0.6; }
 .card img {
   display: block;
   width: 100%;
@@ -127,19 +128,36 @@ header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; }
   font-size: 11px;
 }
 .card .actions button.good-btn:hover { background: #2a5a2a; }
+.card .actions button.okay-btn:hover { background: #5a4a1a; }
 .card .actions button.bad-btn:hover { background: #5a2a2a; }
 .card a { color: #6af; text-decoration: none; }
 .card a:hover { text-decoration: underline; }
+.legend { color: #888; font-size: 12px; margin-top: 6px; }
+.legend kbd {
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-family: inherit;
+  font-size: 11px;
+  color: #ddd;
+}
 """
 
 
 JS = """
 const STORAGE_KEY = 'still_extractor_labels_v1';
+const VALID_LABELS = ['good', 'okay', 'bad'];
 
 function loadLabels() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
+    const parsed = raw ? JSON.parse(raw) : {};
+    const cleaned = {};
+    for (const k in parsed) {
+      if (VALID_LABELS.includes(parsed[k])) cleaned[k] = parsed[k];
+    }
+    return cleaned;
   } catch (e) {
     return {};
   }
@@ -152,37 +170,39 @@ function saveLabels(labels) {
 let labels = loadLabels();
 let currentFilter = 'all';
 
-function applyLabel(card, label) {
+function applyLabel(card, label, advance) {
   const key = card.dataset.filename;
+  card.classList.remove('good', 'okay', 'bad');
   if (label === 'clear') {
     delete labels[key];
-    card.classList.remove('good', 'bad');
   } else {
     labels[key] = label;
-    card.classList.remove('good', 'bad');
     card.classList.add(label);
   }
   saveLabels(labels);
   updateSummary();
+  const next = advance ? nextVisibleCard(card) : null;
   applyFilter();
+  if (next) next.focus();
 }
 
 function restoreLabels() {
   document.querySelectorAll('.card').forEach(card => {
     const lbl = labels[card.dataset.filename];
-    if (lbl === 'good' || lbl === 'bad') card.classList.add(lbl);
+    if (VALID_LABELS.includes(lbl)) card.classList.add(lbl);
   });
 }
 
 function updateSummary() {
-  let good = 0, bad = 0, total = document.querySelectorAll('.card').length;
+  let good = 0, okay = 0, bad = 0, total = document.querySelectorAll('.card').length;
   for (const k in labels) {
     if (labels[k] === 'good') good++;
+    else if (labels[k] === 'okay') okay++;
     else if (labels[k] === 'bad') bad++;
   }
-  const unreviewed = total - good - bad;
+  const unreviewed = total - good - okay - bad;
   document.getElementById('summary').textContent =
-    `${good} good · ${bad} bad · ${unreviewed} unreviewed · ${total} total`;
+    `${good} good · ${okay} okay · ${bad} bad · ${unreviewed} unreviewed · ${total} total`;
 }
 
 function applyFilter() {
@@ -190,6 +210,7 @@ function applyFilter() {
     const lbl = labels[card.dataset.filename];
     let show = true;
     if (currentFilter === 'good') show = lbl === 'good';
+    else if (currentFilter === 'okay') show = lbl === 'okay';
     else if (currentFilter === 'bad') show = lbl === 'bad';
     else if (currentFilter === 'unreviewed') show = !lbl;
     card.style.display = show ? '' : 'none';
@@ -225,6 +246,13 @@ function visibleCards() {
   return Array.from(document.querySelectorAll('.card')).filter(c => c.style.display !== 'none');
 }
 
+function nextVisibleCard(current) {
+  const cards = visibleCards();
+  const idx = cards.indexOf(current);
+  if (idx === -1) return cards[0] || null;
+  return cards[idx + 1] || null;
+}
+
 function moveFocus(dx, dy) {
   const cards = visibleCards();
   if (cards.length === 0) return;
@@ -250,9 +278,10 @@ function moveFocus(dx, dy) {
 document.addEventListener('keydown', e => {
   const card = focusedCard();
   if (card) {
-    if (e.key === 'g' || e.key === 'G') { applyLabel(card, 'good'); e.preventDefault(); }
-    else if (e.key === 'b' || e.key === 'B') { applyLabel(card, 'bad'); e.preventDefault(); }
-    else if (e.key === 'x' || e.key === 'X') { applyLabel(card, 'clear'); e.preventDefault(); }
+    if (e.key === '1') { applyLabel(card, 'bad', true); e.preventDefault(); }
+    else if (e.key === '2') { applyLabel(card, 'okay', true); e.preventDefault(); }
+    else if (e.key === '3') { applyLabel(card, 'good', true); e.preventDefault(); }
+    else if (e.key === 'x' || e.key === 'X') { applyLabel(card, 'clear', false); e.preventDefault(); }
     else if (e.key === 'ArrowLeft') { moveFocus(-1, 0); e.preventDefault(); }
     else if (e.key === 'ArrowRight') { moveFocus(1, 0); e.preventDefault(); }
     else if (e.key === 'ArrowUp') { moveFocus(0, -1); e.preventDefault(); }
@@ -267,16 +296,22 @@ document.addEventListener('DOMContentLoaded', () => {
     b.addEventListener('click', () => setFilter(b.dataset.filter));
   });
   document.getElementById('export-btn').addEventListener('click', exportLabels);
-  document.querySelectorAll('.good-btn').forEach(b => {
-    b.addEventListener('click', e => {
-      e.stopPropagation();
-      applyLabel(b.closest('.card'), 'good');
-    });
-  });
   document.querySelectorAll('.bad-btn').forEach(b => {
     b.addEventListener('click', e => {
       e.stopPropagation();
-      applyLabel(b.closest('.card'), 'bad');
+      applyLabel(b.closest('.card'), 'bad', false);
+    });
+  });
+  document.querySelectorAll('.okay-btn').forEach(b => {
+    b.addEventListener('click', e => {
+      e.stopPropagation();
+      applyLabel(b.closest('.card'), 'okay', false);
+    });
+  });
+  document.querySelectorAll('.good-btn').forEach(b => {
+    b.addEventListener('click', e => {
+      e.stopPropagation();
+      applyLabel(b.closest('.card'), 'good', false);
     });
   });
 });
@@ -308,8 +343,9 @@ def _build_card(row: pd.Series, b64: str, frame_col: str) -> str:
     <div class="sub">aes {aes_str} · face {fs_str} · eye {eye_str}</div>
   </div>
   <div class="actions">
-    <button class="good-btn">Good (G)</button>
-    <button class="bad-btn">Bad (B)</button>
+    <button class="bad-btn">Bad (1)</button>
+    <button class="okay-btn">Okay (2)</button>
+    <button class="good-btn">Good (3)</button>
   </div>
 </div>"""
 
@@ -386,10 +422,14 @@ def main() -> None:
   <div class="toolbar">
     <button class="filter-btn active" data-filter="all">All</button>
     <button class="filter-btn" data-filter="good">Good</button>
+    <button class="filter-btn" data-filter="okay">Okay</button>
     <button class="filter-btn" data-filter="bad">Bad</button>
     <button class="filter-btn" data-filter="unreviewed">Unreviewed</button>
     <button id="export-btn">Export Labels</button>
     <span class="summary" id="summary"></span>
+  </div>
+  <div class="legend">
+    Shortcuts: <kbd>1</kbd> Bad &middot; <kbd>2</kbd> Okay &middot; <kbd>3</kbd> Good &middot; <kbd>X</kbd> Clear &middot; <kbd>&larr;</kbd><kbd>&uarr;</kbd><kbd>&darr;</kbd><kbd>&rarr;</kbd> Navigate
   </div>
 </header>
 <div class="grid">
