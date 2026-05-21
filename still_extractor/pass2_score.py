@@ -11,8 +11,13 @@ import imagehash
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as tv_models
+import torchvision.transforms as T
 from aesthetic_predictor_v2_5 import convert_v2_5_from_siglip
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from still_extractor.face_crop import extract_face_crop
@@ -20,6 +25,16 @@ from still_extractor.face_crop import extract_face_crop
 logger = logging.getLogger(__name__)
 
 AESTHETICS_BATCH_SIZE = 32
+
+FACE_QUALITY_LABELS = ["none", "bad", "okay", "good"]
+N_FACE_QUALITY_CLASSES = len(FACE_QUALITY_LABELS)
+FACE_QUALITY_CROP_PADDING = 20
+FACE_QUALITY_INPUT_SIZE = 128
+FACE_QUALITY_TTA_PASSES = 3
+FACE_QUALITY_BATCH_SIZE = 32
+CLASSIFIER_BLEND_WEIGHT = 0.8
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 def _load_index(index_file: Path) -> pd.DataFrame:
@@ -140,6 +155,176 @@ def score_eye_openness(df: pd.DataFrame) -> pd.Series:
     return pd.Series(normed, index=df.index, name="eye_norm")
 
 
+def _parse_kps(value) -> list | None:
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _build_face_quality_model() -> nn.Module:
+    backbone = tv_models.mobilenet_v3_small(weights=None)
+    in_features = backbone.classifier[3].in_features
+    backbone.classifier[3] = nn.Linear(in_features, N_FACE_QUALITY_CLASSES)
+    return backbone
+
+
+def _load_face_quality_model(model_path: Path, device: torch.device) -> nn.Module:
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    if isinstance(checkpoint, dict) and "model_state" in checkpoint:
+        state_dict = checkpoint["model_state"]
+    else:
+        state_dict = checkpoint
+    model = _build_face_quality_model()
+    model.load_state_dict(state_dict)
+    return model.eval().to(device)
+
+
+def _build_face_quality_transforms() -> tuple[T.Compose, T.Compose]:
+    val_tf = T.Compose([
+        T.Resize((FACE_QUALITY_INPUT_SIZE, FACE_QUALITY_INPUT_SIZE)),
+        T.ToTensor(),
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
+    train_tf = T.Compose([
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomRotation(
+            degrees=15, interpolation=T.InterpolationMode.BICUBIC, fill=0,
+        ),
+        T.RandomResizedCrop(
+            size=FACE_QUALITY_INPUT_SIZE,
+            scale=(0.80, 1.00),
+            ratio=(0.9, 1.1),
+            interpolation=T.InterpolationMode.BICUBIC,
+        ),
+        T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.05),
+        T.ToTensor(),
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
+    return train_tf, val_tf
+
+
+def _extract_face_quality_crop(row: pd.Series) -> Image.Image | None:
+    frame_path = row.get("frame_path")
+    if not isinstance(frame_path, str) or not frame_path:
+        return None
+    p = Path(frame_path)
+    if not p.exists():
+        return None
+    try:
+        crop = extract_face_crop(
+            p,
+            row["face_x1"], row["face_y1"], row["face_x2"], row["face_y2"],
+            FACE_QUALITY_CROP_PADDING,
+            kps=_parse_kps(row.get("kps")),
+        )
+    except Exception as e:
+        logger.warning("Failed to crop %s for classifier: %s", p, e)
+        return None
+    return crop.resize(
+        (FACE_QUALITY_INPUT_SIZE, FACE_QUALITY_INPUT_SIZE), Image.BICUBIC,
+    )
+
+
+class _FaceQualityCropDataset(Dataset):
+    def __init__(self, crops: list[Image.Image], transform: T.Compose) -> None:
+        self.crops = crops
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.crops)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        return self.transform(self.crops[idx])
+
+
+@torch.no_grad()
+def _run_face_quality_pass(
+    model: nn.Module, crops: list[Image.Image], transform: T.Compose,
+    device: torch.device, batch_size: int,
+) -> np.ndarray:
+    ds = _FaceQualityCropDataset(crops, transform)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    out: list[np.ndarray] = []
+    for x in loader:
+        x = x.to(device, non_blocking=True)
+        logits = model(x)
+        probs = F.softmax(logits, dim=1).cpu().numpy()
+        out.append(probs)
+    return np.concatenate(out, axis=0) if out else np.zeros((0, N_FACE_QUALITY_CLASSES))
+
+
+def run_classifier_inference(
+    df: pd.DataFrame, model_path: Path, device: torch.device,
+    n_tta: int = FACE_QUALITY_TTA_PASSES,
+    batch_size: int = FACE_QUALITY_BATCH_SIZE,
+) -> pd.DataFrame:
+    """Run the face-quality classifier on each row's face crop, with TTA.
+
+    Returns a DataFrame indexed identically to `df` with columns
+    `p_none_tta`, `p_bad_tta`, `p_okay_tta`, `p_good_tta`,
+    `pred_label`, `pred_confidence`. Rows whose face crop could not be
+    extracted are filled with NaN.
+    """
+    model = _load_face_quality_model(model_path, device)
+    train_tf, _ = _build_face_quality_transforms()
+
+    crops: list[Image.Image | None] = []
+    for _, row in tqdm(
+        df.iterrows(), total=len(df), desc="classifier-crops",
+    ):
+        crops.append(_extract_face_quality_crop(row))
+
+    valid_positions = [i for i, c in enumerate(crops) if c is not None]
+    valid_crops = [crops[i] for i in valid_positions]
+    if not valid_crops:
+        logger.warning("Classifier: no valid face crops to score")
+        empty = pd.DataFrame(
+            index=df.index,
+            columns=[
+                f"p_{lbl}_tta" for lbl in FACE_QUALITY_LABELS
+            ] + ["pred_label", "pred_confidence"],
+        )
+        return empty
+
+    accum = np.zeros((len(valid_crops), N_FACE_QUALITY_CLASSES), dtype=np.float32)
+    n_passes = max(n_tta, 1)
+    for k in range(n_passes):
+        logger.info("Classifier TTA pass %d/%d", k + 1, n_passes)
+        accum += _run_face_quality_pass(
+            model, valid_crops, train_tf, device, batch_size,
+        ).astype(np.float32)
+    tta_probs = accum / n_passes
+
+    columns = [f"p_{lbl}_tta" for lbl in FACE_QUALITY_LABELS] + [
+        "pred_label", "pred_confidence",
+    ]
+    out = pd.DataFrame(index=df.index, columns=columns, dtype=object)
+    for c, lbl in enumerate(FACE_QUALITY_LABELS):
+        out[f"p_{lbl}_tta"] = np.nan
+    out["pred_confidence"] = np.nan
+    out["pred_label"] = ""
+    for pos, row_pos in enumerate(valid_positions):
+        idx = df.index[row_pos]
+        for c, lbl in enumerate(FACE_QUALITY_LABELS):
+            out.at[idx, f"p_{lbl}_tta"] = float(tta_probs[pos, c])
+        c_best = int(np.argmax(tta_probs[pos]))
+        out.at[idx, "pred_label"] = FACE_QUALITY_LABELS[c_best]
+        out.at[idx, "pred_confidence"] = float(tta_probs[pos, c_best])
+    for lbl in FACE_QUALITY_LABELS:
+        out[f"p_{lbl}_tta"] = out[f"p_{lbl}_tta"].astype(float)
+    out["pred_confidence"] = out["pred_confidence"].astype(float)
+
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return out
+
+
 def _composite(
     df: pd.DataFrame, aesthetics_weight: float, face_sharpness_weight: float,
     eye_weight: float,
@@ -246,6 +431,9 @@ def main() -> None:
                         help="dHash Hamming distance threshold for full-frame dedup; <= is duplicate.")
     parser.add_argument("--dedup-threshold", type=int, default=None,
                         help="DEPRECATED: alias for --frame-dedup-threshold.")
+    parser.add_argument("--classifier-model", type=Path,
+                        default=Path("models/face_quality/best_model.pt"),
+                        help="Path to trained face quality classifier model weights.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -282,6 +470,37 @@ def main() -> None:
             row["video_stem"], row["timestamp_s"], row["composite"],
             row["aesthetics_norm"], row["face_sharpness_norm"], row["eye_norm"],
         )
+
+    if args.classifier_model and args.classifier_model.exists():
+        logger.info("[CLASSIFIER] Loaded model from %s", args.classifier_model)
+        clf_scores = run_classifier_inference(df, args.classifier_model, device)
+        df = df.join(clf_scores)
+        df["composite_old"] = df["composite"]
+        old_min = float(df["composite_old"].min())
+        old_max = float(df["composite_old"].max())
+        blended = (
+            CLASSIFIER_BLEND_WEIGHT * df["p_good_tta"]
+            + (1.0 - CLASSIFIER_BLEND_WEIGHT) * df["composite_old"]
+        )
+        df["composite"] = blended.where(df["p_good_tta"].notna(), df["composite_old"])
+        n_scored = int(df["p_good_tta"].notna().sum())
+        logger.info("[CLASSIFIER] Ran inference on %d candidates", n_scored)
+        new_min = float(df["composite"].min())
+        new_max = float(df["composite"].max())
+        logger.info(
+            "[CLASSIFIER] composite score range: [%.3f, %.3f] (was [%.3f, %.3f])",
+            new_min, new_max, old_min, old_max,
+        )
+    else:
+        if args.classifier_model:
+            logger.warning(
+                "[CLASSIFIER] Model not found at %s; proceeding with original composite",
+                args.classifier_model,
+            )
+        else:
+            logger.info(
+                "[CLASSIFIER] No classifier model specified; using original composite",
+            )
 
     df = df.sort_values("composite", ascending=False).reset_index(drop=True)
 

@@ -538,9 +538,9 @@ def main() -> None:
     parser.add_argument("--image-root", type=Path, default=None,
                         help="Root directory for resolving relative image paths.")
     parser.add_argument("--inference-csv", type=Path, default=None,
-                        help="Path to inference_scores.csv from train_classifier.py "
-                             "(optional). If provided, classifier predictions are joined "
-                             "in and shown on each card with sort/filter controls.")
+                        help="Path to inference_scores.csv from train_classifier.py. "
+                             "Defaults to {scores_csv_dir}/classifier/inference_scores.csv. "
+                             "If the file is missing, predictions are silently skipped.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -558,22 +558,40 @@ def main() -> None:
         df = df[df["dedup_kept"].astype(bool)].copy()
         logger.info("Filtered to %d dedup-kept rows", len(df))
 
-    has_pred = False
-    if args.inference_csv is not None:
-        inf_df = pd.read_csv(args.inference_csv)
-        keep_cols = [
-            "frame_path", "pred_label", "pred_confidence",
-            "p_none_tta", "p_bad_tta", "p_okay_tta", "p_good_tta",
-        ]
-        inf_df = inf_df[[c for c in keep_cols if c in inf_df.columns]]
-        before = len(df)
-        df = df.merge(inf_df, on="frame_path", how="left")
-        matched = int(df["pred_label"].notna().sum()) if "pred_label" in df.columns else 0
+    has_pred = "pred_label" in df.columns
+    if has_pred:
+        matched = int(df["pred_label"].notna().sum())
         logger.info(
-            "Joined inference CSV %s: %d/%d rows matched a prediction",
-            args.inference_csv, matched, before,
+            "Found predictions already in %s: %d/%d rows have a prediction",
+            args.scores_csv, matched, len(df),
         )
-        has_pred = "pred_label" in df.columns
+    else:
+        inference_csv = args.inference_csv
+        if inference_csv is None:
+            inference_csv = args.scores_csv.parent / "classifier" / "inference_scores.csv"
+            if not inference_csv.exists():
+                logger.info(
+                    "No inference CSV at default %s; skipping predictions", inference_csv,
+                )
+                inference_csv = None
+
+        if inference_csv is not None:
+            inf_df = pd.read_csv(inference_csv)
+            keep_cols = [
+                "frame_path", "pred_label", "pred_confidence",
+                "p_none_tta", "p_bad_tta", "p_okay_tta", "p_good_tta",
+            ]
+            inf_df = inf_df[[c for c in keep_cols if c in inf_df.columns]]
+            before = len(df)
+            df = df.merge(inf_df, on="frame_path", how="left")
+            matched = (
+                int(df["pred_label"].notna().sum()) if "pred_label" in df.columns else 0
+            )
+            logger.info(
+                "Joined inference CSV %s: %d/%d rows matched a prediction",
+                inference_csv, matched, before,
+            )
+            has_pred = "pred_label" in df.columns
 
     if "composite" in df.columns:
         df = df.sort_values("composite", ascending=False).reset_index(drop=True)

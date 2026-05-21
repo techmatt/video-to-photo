@@ -297,8 +297,8 @@ def main() -> None:
     parser.add_argument("--labels-json", type=Path,
                         default=Path("save/labels.json"))
     parser.add_argument("--output-dir", type=Path,
-                        default=Path("data/mini/classifier"))
-    parser.add_argument("--epochs", type=int, default=40)
+                        default=Path("models/face_quality"))
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
@@ -399,12 +399,12 @@ def main() -> None:
     optimizer, scheduler = _make_optimizer(model, args.lr, args.epochs, start_epoch=0)
     val_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-    phase2_epoch = args.epochs // 2 + 1
+    phase1_end = args.epochs // 2
+    phase2_start = phase1_end + 1
     best_val_loss = float("inf")
     best_epoch = 0
     best_path = args.output_dir / "best_model.pt"
     log_rows: list[dict] = []
-    patience_left = args.patience
 
     header = (
         f"{'epoch':>5} {'ph':>2} {'lr':>9} "
@@ -413,30 +413,21 @@ def main() -> None:
     print(header)
     print("-" * len(header))
 
-    for epoch in range(1, args.epochs + 1):
-        if epoch == phase2_epoch:
-            logger.info("Transitioning to Phase 2 (unfreezing last block + classifier)")
-            _apply_phase(model, 2)
-            optimizer, scheduler = _make_optimizer(
-                model, args.lr, args.epochs, start_epoch=epoch - 1,
-            )
-            patience_left = args.patience  # reset patience at phase change
-
+    def _run_epoch(epoch: int, phase: int) -> tuple[float, float]:
         tr_loss = train_one_epoch(model, train_loader, optimizer, device)
         val_loss, val_acc, per_class_acc = evaluate(
             model, val_loader, device, val_criterion,
         )
         scheduler.step()
-
-        phase = 1 if epoch < phase2_epoch else 2
         cur_lr = optimizer.param_groups[0]["lr"]
         pc_str = " ".join(
             f"{IDX_TO_LABEL[c][0]}={per_class_acc[c]:.2f}"
             for c in range(N_CLASSES)
         )
+        marker = "  [best]" if phase == 2 and val_loss < best_val_loss else ""
         print(
             f"{epoch:>5d} {phase:>2d} {cur_lr:>9.2e} "
-            f"{tr_loss:>9.4f} {val_loss:>9.4f} {val_acc:>8.3f} | {pc_str}"
+            f"{tr_loss:>9.4f} {val_loss:>9.4f} {val_acc:>8.3f} | {pc_str}{marker}"
         )
         log_rows.append({
             "epoch": epoch,
@@ -447,7 +438,28 @@ def main() -> None:
             "val_acc": val_acc,
             **{f"acc_{IDX_TO_LABEL[c]}": per_class_acc[c] for c in range(N_CLASSES)},
         })
+        return tr_loss, val_loss
 
+    logger.info(
+        "=== Phase 1: training head only (epochs 1-%d) ===", phase1_end,
+    )
+    for epoch in range(1, phase1_end + 1):
+        _run_epoch(epoch, phase=1)
+
+    logger.info(
+        "=== Phase 2: unfreezing last conv block (epochs %d-%d) ===",
+        phase2_start, args.epochs,
+    )
+    _apply_phase(model, 2)
+    optimizer, scheduler = _make_optimizer(
+        model, args.lr, args.epochs, start_epoch=phase1_end,
+    )
+    best_val_loss = float("inf")
+    best_epoch = 0
+    patience_left = args.patience
+
+    for epoch in range(phase2_start, args.epochs + 1):
+        _, val_loss = _run_epoch(epoch, phase=2)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
@@ -524,6 +536,12 @@ def main() -> None:
     inference_path = args.output_dir / "inference_scores.csv"
     out.to_csv(inference_path, index=False)
     logger.info("Wrote %s (%d rows)", inference_path, len(out))
+
+    # Also write alongside the scores CSV so the HTML builder finds it by default.
+    scores_inference_path = args.scores_csv.parent / "classifier" / "inference_scores.csv"
+    scores_inference_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(scores_inference_path, index=False)
+    logger.info("Wrote %s (%d rows)", scores_inference_path, len(out))
 
     nonempty_preds = [p for p in pred_labels if p]
     pred_counts = pd.Series(nonempty_preds).value_counts().to_dict()
