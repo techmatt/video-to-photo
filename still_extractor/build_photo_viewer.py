@@ -1,13 +1,17 @@
 """Build a self-contained HTML photo viewer for browsing and flagging refined frames."""
 
 import html
+import json
 import logging
 from argparse import ArgumentParser
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 import pandas as pd
 from PIL import ExifTags, Image
+
+from still_extractor.inventory import RunConfig
 
 logger = logging.getLogger(__name__)
 
@@ -630,11 +634,17 @@ def main() -> None:
     parser = ArgumentParser(
         description="Build a self-contained HTML photo viewer for refined frames.",
     )
-    parser.add_argument("--scores-csv", type=Path, default=Path("data/refined_scores.csv"),
+    parser.add_argument("--config", type=Path, default=None,
+                        help="Run YAML config. When provided, --scores-csv, "
+                             "--output-html and --parquet default to "
+                             "{output_dir}/refined_scores.csv, "
+                             "{output_dir}/index_photos.html and "
+                             "{output_dir}/index.parquet. Explicit flags still override.")
+    parser.add_argument("--scores-csv", type=Path, default=None,
                         help="Path to refined_scores.csv.")
-    parser.add_argument("--output-html", type=Path, default=Path("data/index_photos.html"),
+    parser.add_argument("--output-html", type=Path, default=None,
                         help="Path to write the HTML file.")
-    parser.add_argument("--parquet", type=Path, default=Path("data/index.parquet"),
+    parser.add_argument("--parquet", type=Path, default=None,
                         help="Pass 1 index parquet (for video_path / frame_w / frame_h).")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -645,6 +655,20 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         force=True,
     )
+
+    if args.config is not None:
+        cfg = RunConfig.from_yaml(args.config)
+        if args.scores_csv is None:
+            args.scores_csv = cfg.output_dir / "refined_scores.csv"
+        if args.output_html is None:
+            args.output_html = cfg.output_dir / "index_photos.html"
+        if args.parquet is None:
+            args.parquet = cfg.output_dir / "index.parquet"
+    if args.scores_csv is None or args.output_html is None or args.parquet is None:
+        parser.error(
+            "--scores-csv, --output-html, and --parquet are required when "
+            "--config is not provided",
+        )
 
     df = pd.read_csv(args.scores_csv)
     logger.info("Loaded %d rows from %s", len(df), args.scores_csv)
@@ -776,11 +800,25 @@ def main() -> None:
 """
 
     args.output_html.write_text(body, encoding="utf-8")
+    file_size_mb = args.output_html.stat().st_size / (1024 * 1024)
     logger.info(
         "Wrote %s (%d cards, %.2f MB)",
-        args.output_html, len(cards),
-        args.output_html.stat().st_size / (1024 * 1024),
+        args.output_html, len(cards), file_size_mb,
     )
+
+    summary = {
+        "stage": "build_photo_viewer",
+        "config": str(args.config) if args.config is not None else None,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "card_count": len(cards),
+        "video_source": len(cards) - image_source_count,
+        "image_source": image_source_count,
+        "output_html": str(args.output_html),
+        "file_size_mb": round(file_size_mb, 2),
+    }
+    summary_path = args.output_html.parent / "build_photo_viewer_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    logger.info("Wrote summary to %s", summary_path)
 
 
 if __name__ == "__main__":

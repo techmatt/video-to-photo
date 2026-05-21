@@ -4,6 +4,7 @@ import json
 import logging
 import shutil
 from argparse import ArgumentParser
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -21,6 +22,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from still_extractor.face_crop import extract_face_crop
+from still_extractor.inventory import RunConfig
 
 logger = logging.getLogger(__name__)
 
@@ -409,9 +411,13 @@ def main() -> None:
     parser = ArgumentParser(
         description="Score indexed frames, deduplicate, and emit top-K JPEGs.",
     )
-    parser.add_argument("--index-file", type=Path, default=Path("data/index.parquet"),
+    parser.add_argument("--config", type=Path, default=None,
+                        help="Run YAML config. When provided, --index-file and "
+                             "--output-dir default to {output_dir}/index.parquet "
+                             "and {output_dir}. Explicit flags still override.")
+    parser.add_argument("--index-file", type=Path, default=None,
                         help="Parquet file from Pass 1.")
-    parser.add_argument("--output-dir", type=Path, default=Path("data"),
+    parser.add_argument("--output-dir", type=Path, default=None,
                         help="Root output dir; JPEGs go to {output-dir}/top_frames/.")
     parser.add_argument("--top-k-per-file", type=int, default=5,
                         help="Max frames to select per source file.")
@@ -449,6 +455,17 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         force=True,
     )
+
+    if args.config is not None:
+        cfg = RunConfig.from_yaml(args.config)
+        if args.index_file is None:
+            args.index_file = cfg.output_dir / "index.parquet"
+        if args.output_dir is None:
+            args.output_dir = cfg.output_dir
+    if args.index_file is None or args.output_dir is None:
+        parser.error(
+            "--index-file and --output-dir are required when --config is not provided",
+        )
 
     df = _load_index(args.index_file)
     if df.empty:
@@ -595,6 +612,39 @@ def main() -> None:
     logger.info("[SELECTION] Copied %d frames to %s", copied, top_frames_dir)
 
     _write_scores_csv(df, args.output_dir / "scores.csv")
+
+    final_count = int(df["final_selection"].sum())
+    files_with_selection = int(
+        df[df["final_selection"]]["video_stem"].nunique()
+    )
+    files_with_zero_selection = int(
+        len(set(df["video_stem"].unique())) - files_with_selection
+    )
+    composite_lo = float(df["composite"].min())
+    composite_hi = float(df["composite"].max())
+    classifier_active = bool(args.classifier_model and args.classifier_model.exists())
+    summary = {
+        "stage": "pass2",
+        "config": str(args.config) if args.config is not None else None,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "final_selection_count": final_count,
+        "files_with_selection": files_with_selection,
+        "files_with_zero_selection": files_with_zero_selection,
+        "classifier_active": classifier_active,
+        "classifier_model": (
+            str(args.classifier_model) if classifier_active else None
+        ),
+        "composite_range": [composite_lo, composite_hi],
+    }
+    if classifier_active and "pred_label" in df.columns:
+        kept = df[df["final_selection"]]
+        counts = kept["pred_label"].fillna("").replace("", "none").value_counts()
+        summary["pred_label_counts"] = {
+            lbl: int(counts.get(lbl, 0)) for lbl in FACE_QUALITY_LABELS
+        }
+    summary_path = args.output_dir / "pass2_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    logger.info("Wrote summary to %s", summary_path)
 
 
 if __name__ == "__main__":

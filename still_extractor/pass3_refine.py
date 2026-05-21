@@ -1,7 +1,9 @@
 """Pass 3: micro-window refinement around top-K candidates from Pass 2."""
 
+import json
 import logging
 from argparse import ArgumentParser
+from datetime import datetime, timezone
 from pathlib import Path
 
 import av
@@ -9,6 +11,8 @@ import cv2
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+from still_extractor.inventory import RunConfig
 
 logger = logging.getLogger(__name__)
 
@@ -155,9 +159,13 @@ def main() -> None:
     parser = ArgumentParser(
         description="Refine top-K candidates by picking the sharpest frame in a micro-window.",
     )
-    parser.add_argument("--scores-csv", type=Path, default=Path("data/scores.csv"),
+    parser.add_argument("--config", type=Path, default=None,
+                        help="Run YAML config. When provided, --scores-csv and "
+                             "--output-dir default to {output_dir}/scores.csv and "
+                             "{output_dir}. Explicit flags still override.")
+    parser.add_argument("--scores-csv", type=Path, default=None,
                         help="Path to scores.csv from Pass 2.")
-    parser.add_argument("--output-dir", type=Path, default=Path("data"),
+    parser.add_argument("--output-dir", type=Path, default=None,
                         help="Root output dir; refined JPEGs go to {output-dir}/refined/.")
     parser.add_argument("--ffmpeg-path", type=str, default="ffmpeg",
                         help="ffmpeg executable path. Reserved; PyAV uses bundled libs.")
@@ -172,6 +180,17 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         force=True,
     )
+
+    if args.config is not None:
+        cfg = RunConfig.from_yaml(args.config)
+        if args.scores_csv is None:
+            args.scores_csv = cfg.output_dir / "scores.csv"
+        if args.output_dir is None:
+            args.output_dir = cfg.output_dir
+    if args.scores_csv is None or args.output_dir is None:
+        parser.error(
+            "--scores-csv and --output-dir are required when --config is not provided",
+        )
 
     if args.ffmpeg_path != "ffmpeg":
         logger.debug(
@@ -232,6 +251,26 @@ def main() -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     kept.to_csv(out_csv, index=False)
     logger.info("Wrote %d rows to %s", len(kept), out_csv)
+
+    is_image_src = kept["video_path"].map(
+        lambda p: Path(str(p)).suffix.lower() in IMAGE_EXTENSIONS,
+    )
+    image_passthrough = int(is_image_src.sum())
+    video_refined = int(len(kept) - image_passthrough)
+    summary = {
+        "stage": "pass3",
+        "config": str(args.config) if args.config is not None else None,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "refined_count": int(len(kept)),
+        "video_source_refined": video_refined,
+        "image_source_passthrough": image_passthrough,
+        "mean_sharpness_delta": float(deltas.mean()) if len(deltas) else None,
+        "min_sharpness_delta": float(deltas.min()) if len(deltas) else None,
+        "max_sharpness_delta": float(deltas.max()) if len(deltas) else None,
+    }
+    summary_path = args.output_dir / "pass3_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    logger.info("Wrote summary to %s", summary_path)
 
 
 if __name__ == "__main__":

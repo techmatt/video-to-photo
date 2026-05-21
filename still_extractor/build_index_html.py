@@ -6,12 +6,14 @@ import io
 import json
 import logging
 from argparse import ArgumentParser
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 from tqdm import tqdm
 
 from still_extractor.face_crop import extract_face_crop
+from still_extractor.inventory import RunConfig
 
 logger = logging.getLogger(__name__)
 
@@ -531,9 +533,13 @@ def main() -> None:
     parser = ArgumentParser(
         description="Build a self-contained HTML labeling UI for refined or scored frames.",
     )
-    parser.add_argument("--scores-csv", type=Path, default=Path("data/refined_scores.csv"),
+    parser.add_argument("--config", type=Path, default=None,
+                        help="Run YAML config. When provided, --scores-csv and "
+                             "--output-html default to {output_dir}/refined_scores.csv "
+                             "and {output_dir}/index.html. Explicit flags still override.")
+    parser.add_argument("--scores-csv", type=Path, default=None,
                         help="Path to refined_scores.csv (or scores.csv if Pass 3 not run).")
-    parser.add_argument("--output-html", type=Path, default=Path("data/index.html"),
+    parser.add_argument("--output-html", type=Path, default=None,
                         help="Path to write the HTML file.")
     parser.add_argument("--image-root", type=Path, default=None,
                         help="Root directory for resolving relative image paths.")
@@ -550,6 +556,17 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         force=True,
     )
+
+    if args.config is not None:
+        cfg = RunConfig.from_yaml(args.config)
+        if args.scores_csv is None:
+            args.scores_csv = cfg.output_dir / "refined_scores.csv"
+        if args.output_html is None:
+            args.output_html = cfg.output_dir / "index.html"
+    if args.scores_csv is None or args.output_html is None:
+        parser.error(
+            "--scores-csv and --output-html are required when --config is not provided",
+        )
 
     df = pd.read_csv(args.scores_csv)
     logger.info("Loaded %d rows from %s", len(df), args.scores_csv)
@@ -684,9 +701,21 @@ def main() -> None:
 
     args.output_html.parent.mkdir(parents=True, exist_ok=True)
     args.output_html.write_text(html_doc, encoding="utf-8")
+    file_size_mb = args.output_html.stat().st_size / (1024 * 1024)
     logger.info("Wrote %s (%d cards, %.1f MB)",
-                args.output_html, len(cards),
-                args.output_html.stat().st_size / (1024 * 1024))
+                args.output_html, len(cards), file_size_mb)
+
+    summary = {
+        "stage": "build_index_html",
+        "config": str(args.config) if args.config is not None else None,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "card_count": len(cards),
+        "output_html": str(args.output_html),
+        "file_size_mb": round(file_size_mb, 2),
+    }
+    summary_path = args.output_html.parent / "build_index_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    logger.info("Wrote summary to %s", summary_path)
 
 
 if __name__ == "__main__":

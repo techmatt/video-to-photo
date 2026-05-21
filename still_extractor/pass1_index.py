@@ -886,6 +886,33 @@ def main() -> None:
     print(f"Parquet written: {index_path} ({total_index_rows:,} rows)")
     print("───────────────────────────────────────")
 
+    status_df = pd.read_csv(status_path) if status_path.exists() else pd.DataFrame()
+    zero_candidate_files = 0
+    total_done = 0
+    total_failed = 0
+    if not status_df.empty:
+        latest = status_df.drop_duplicates(subset=["file_path"], keep="last")
+        done_rows = latest[latest["status"] == "done"]
+        total_done = int(len(done_rows))
+        total_failed = int((latest["status"] == "failed").sum())
+        zero_candidate_files = int(
+            (done_rows["frames_written"].fillna(0).astype(int) == 0).sum()
+        )
+    summary = {
+        "stage": "pass1",
+        "config": str(args.config),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "total_files": total_done + total_failed,
+        "candidate_frames": int(total_index_rows),
+        "video_frames": int(video_rows_total),
+        "image_frames": int(image_rows_total),
+        "zero_candidate_files": zero_candidate_files,
+        "failures": total_failed,
+    }
+    summary_path = output_dir / "pass1_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"Summary: {summary_path}")
+
 
 if __name__ == "__main__":
     main()
