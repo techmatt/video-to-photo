@@ -1,19 +1,24 @@
 """Build a self-contained HTML photo viewer for browsing and flagging refined frames."""
 
 import html
-import json
 import logging
-import math
 from argparse import ArgumentParser
 from pathlib import Path
 from urllib.parse import quote
 
 import pandas as pd
+from PIL import ExifTags, Image
 
 logger = logging.getLogger(__name__)
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".bmp"}
+
+_EXIF_ORIENTATION_TAG = next(
+    k for k, v in ExifTags.TAGS.items() if v == "Orientation"
+)
+# EXIF orientation tag -> clockwise rotation needed for correct display
+_EXIF_ORIENTATION_TO_DEG = {1: 0, 3: 180, 6: 90, 8: 270}
 
 
 def _safe_float(v) -> float | None:
@@ -30,17 +35,16 @@ def _to_fwd_slash(p: str | Path) -> str:
     return str(p).replace("\\", "/")
 
 
-def _compute_roll(kps_str) -> float:
-    """Roll angle in degrees from left eye (kps[0]) and right eye (kps[1])."""
-    if not isinstance(kps_str, str) or not kps_str:
-        return 0.0
+def get_image_rotation_deg(image_path: str | Path) -> int:
+    """Return clockwise degrees (0/90/180/270) to rotate the image for correct display."""
     try:
-        kps = json.loads(kps_str)
-        lx, ly = kps[0]
-        rx, ry = kps[1]
-        return math.degrees(math.atan2(ry - ly, rx - lx))
+        with Image.open(image_path) as img:
+            exif = img.getexif()
+            if not exif:
+                return 0
+            return _EXIF_ORIENTATION_TO_DEG.get(exif.get(_EXIF_ORIENTATION_TAG, 1), 0)
     except Exception:
-        return 0.0
+        return 0
 
 
 def _make_img_src(img_path: Path, html_dir: Path) -> str:
@@ -55,6 +59,7 @@ def _make_img_src(img_path: Path, html_dir: Path) -> str:
 
 CSS = """
 * { box-sizing: border-box; }
+html, body { min-width: 1400px; }
 body {
   margin: 0;
   padding: 16px;
@@ -131,6 +136,22 @@ header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; }
 .photo-card:hover .overlay { opacity: 1; }
 .photo-card .overlay .stem { color: #bbb; font-size: 11px; word-break: break-all; }
 
+.video-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 20px;
+  height: 20px;
+  background: rgba(0,0,0,0.55);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 10;
+}
+.photo-card[data-source-type="image"] .video-badge { display: none; }
+
 .flag-btn {
   position: absolute;
   top: 6px;
@@ -206,12 +227,15 @@ header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; }
 
 JS = """
 const FILTER_KEY = 'photoViewer.filter';
+const SOURCE_FILTER_KEY = 'photoViewer.sourceFilter';
 const SORT_KEY = 'photoViewer.sort';
 const FLAG_PREFIX = 'flag:';
 
 let currentFilter = 'good';
+let currentSourceFilter = 'all';
 let currentSort = 'confidence';
 let lightboxIndex = -1;
+let lastLayoutContainerWidth = -1;
 
 function flagKey(card) { return FLAG_PREFIX + card.dataset.exportPath; }
 function isFlagged(card) { return localStorage.getItem(flagKey(card)) === '1'; }
@@ -255,8 +279,13 @@ function updateFlagCount() {
 }
 
 function passesFilter(card) {
-  if (currentFilter === 'all') return true;
-  return (card.dataset.predLabel || '').toLowerCase() === currentFilter;
+  if (currentFilter !== 'all') {
+    if ((card.dataset.predLabel || '').toLowerCase() !== currentFilter) return false;
+  }
+  if (currentSourceFilter !== 'all') {
+    if (card.dataset.sourceType !== currentSourceFilter) return false;
+  }
+  return true;
 }
 
 function visibleCards() {
@@ -273,43 +302,17 @@ function applyFilter() {
     card.style.display = passesFilter(card) ? '' : 'none';
   });
   updateShownCount();
-  relayout();
+  relayout(true);
 }
 
 const TARGET_ROW_HEIGHT = 220;
 const GRID_SPACING = 4;
 
 function justifyGrid(cards, containerWidth, targetRowHeight, spacing) {
+  // READ PASS: compute layout entirely in memory, no DOM writes.
+  const layout = []; // [{ row: [cardObj,...], widths: [int,...], height: int }]
   let row = [];
   let rowAspectSum = 0;
-
-  function flushRow(row, rowAspectSum, isLastRow) {
-    const totalSpacing = spacing * (row.length - 1);
-    if (isLastRow) {
-      row.forEach(({element, aspectRatio}) => {
-        const w = Math.round(aspectRatio * targetRowHeight);
-        element.style.width = w + 'px';
-        element.style.height = Math.round(targetRowHeight) + 'px';
-        element.style.flexShrink = '0';
-      });
-      return;
-    }
-    const rowHeight = (containerWidth - totalSpacing) / rowAspectSum;
-    let usedWidth = 0;
-    row.forEach(({element, aspectRatio}, idx) => {
-      let w;
-      if (idx === row.length - 1) {
-        // last card in a packed row absorbs rounding remainder so total fits exactly
-        w = containerWidth - totalSpacing - usedWidth;
-      } else {
-        w = Math.floor(aspectRatio * rowHeight);
-        usedWidth += w;
-      }
-      element.style.width = w + 'px';
-      element.style.height = Math.round(rowHeight) + 'px';
-      element.style.flexShrink = '0';
-    });
-  }
 
   for (const card of cards) {
     row.push(card);
@@ -317,39 +320,76 @@ function justifyGrid(cards, containerWidth, targetRowHeight, spacing) {
     const totalSpacing = spacing * (row.length - 1);
     const rowHeight = (containerWidth - totalSpacing) / rowAspectSum;
     if (rowHeight <= targetRowHeight) {
-      flushRow(row, rowAspectSum, false);
+      const widths = new Array(row.length);
+      let usedWidth = 0;
+      for (let i = 0; i < row.length; i++) {
+        let w;
+        if (i === row.length - 1) {
+          // last card absorbs rounding remainder so total fits exactly
+          w = containerWidth - totalSpacing - usedWidth;
+        } else {
+          w = Math.floor(row[i].aspectRatio * rowHeight);
+          usedWidth += w;
+        }
+        widths[i] = w;
+      }
+      layout.push({ row, widths, height: Math.round(rowHeight) });
       row = [];
       rowAspectSum = 0;
     }
   }
-  if (row.length > 0) flushRow(row, rowAspectSum, true);
+  if (row.length > 0) {
+    // trailing partial row: left-justified at target row height
+    const widths = row.map(c => Math.round(c.aspectRatio * targetRowHeight));
+    layout.push({ row, widths, height: Math.round(targetRowHeight) });
+  }
+
+  // WRITE PASS: apply all style changes with no interleaved reads.
+  for (const { row: rowCards, widths, height } of layout) {
+    const heightPx = height + 'px';
+    for (let i = 0; i < rowCards.length; i++) {
+      const s = rowCards[i].element.style;
+      s.width = widths[i] + 'px';
+      s.height = heightPx;
+      s.flexShrink = '0';
+    }
+  }
 }
 
-function relayout() {
+function relayout(force) {
   const grid = document.querySelector('.grid');
   if (!grid) return;
   const containerWidth = grid.clientWidth;
   if (containerWidth <= 0) return;
+  if (!force && containerWidth === lastLayoutContainerWidth) return;
+  lastLayoutContainerWidth = containerWidth;
   const cards = visibleCards().map(el => ({
     element: el,
     aspectRatio: parseFloat(el.dataset.aspect) || 1.0,
   }));
   justifyGrid(cards, containerWidth, TARGET_ROW_HEIGHT, GRID_SPACING);
+  applyRotations();
 }
 
 function applyRotations() {
   document.querySelectorAll('.photo-card').forEach(card => {
-    const roll = parseFloat(card.dataset.roll) || 0;
+    const deg = parseInt(card.dataset.rotation || '0', 10);
     const img = card.querySelector('img');
     if (!img) return;
-    if (Math.abs(roll) <= 2) {
+    if (deg === 0) {
       img.style.transform = '';
+      img.style.width = '';
+      img.style.height = '';
       return;
     }
-    const rad = Math.abs(roll) * Math.PI / 180;
-    // scale UP so the rotated image still covers the (square-ish) card corners
-    const scale = Math.min(Math.abs(Math.cos(rad)) + Math.abs(Math.sin(rad)), 1.5);
-    img.style.transform = `rotate(${-roll}deg) scale(${scale})`;
+    img.style.transform = `rotate(${deg}deg)`;
+    if (deg === 90 || deg === 270) {
+      // After CSS-rotating 90/270, the image's natural axis is perpendicular to
+      // the card. Set its layout width/height to the card's opposite dimension
+      // so the rotated bitmap fills the card.
+      img.style.width = card.style.height;
+      img.style.height = card.style.width;
+    }
   });
 }
 
@@ -358,6 +398,15 @@ function setFilter(f) {
   localStorage.setItem(FILTER_KEY, f);
   document.querySelectorAll('.filter-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.filter === f);
+  });
+  applyFilter();
+}
+
+function setSourceFilter(f) {
+  currentSourceFilter = f;
+  localStorage.setItem(SOURCE_FILTER_KEY, f);
+  document.querySelectorAll('.source-filter-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.sourceFilter === f);
   });
   applyFilter();
 }
@@ -379,7 +428,7 @@ function sortCards(mode) {
   document.querySelectorAll('.sort-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.sort === mode);
   });
-  relayout();
+  relayout(true);
 }
 
 function openLightbox(idx) {
@@ -448,21 +497,28 @@ function exportFlagged() {
 
 document.addEventListener('DOMContentLoaded', () => {
   restoreFlags();
-  applyRotations();
   const savedFilter = localStorage.getItem(FILTER_KEY);
+  const savedSourceFilter = localStorage.getItem(SOURCE_FILTER_KEY);
   const savedSort = localStorage.getItem(SORT_KEY);
   sortCards(savedSort && ['confidence', 'aesthetic', 'coverage'].includes(savedSort) ? savedSort : 'confidence');
+  currentSourceFilter = savedSourceFilter && ['all', 'video', 'image'].includes(savedSourceFilter) ? savedSourceFilter : 'all';
+  document.querySelectorAll('.source-filter-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.sourceFilter === currentSourceFilter);
+  });
   setFilter(savedFilter && ['all', 'good', 'okay', 'bad', 'none'].includes(savedFilter) ? savedFilter : 'good');
   updateFlagCount();
 
   let resizeTimer = null;
   window.addEventListener('resize', () => {
     if (resizeTimer) clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(relayout, 100);
+    resizeTimer = setTimeout(() => relayout(false), 250);
   });
 
   document.querySelectorAll('.filter-btn').forEach(b => {
     b.addEventListener('click', () => setFilter(b.dataset.filter));
+  });
+  document.querySelectorAll('.source-filter-btn').forEach(b => {
+    b.addEventListener('click', () => setSourceFilter(b.dataset.sourceFilter));
   });
   document.querySelectorAll('.sort-btn').forEach(b => {
     b.addEventListener('click', () => sortCards(b.dataset.sort));
@@ -505,12 +561,22 @@ document.addEventListener('DOMContentLoaded', () => {
 """
 
 
+VIDEO_BADGE_HTML = (
+    '<div class="video-badge" title="Video source">'
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="14" height="14" fill="white">'
+    '<path d="M8 5v14l11-7z"/>'
+    '</svg>'
+    '</div>'
+)
+
+
 def _build_card(
     row: pd.Series,
     thumb_src: str,
     export_path: str,
     aspect: float,
-    roll: float,
+    rotation: int,
+    is_image_source: bool,
 ) -> str:
     pred_raw = row.get("pred_label")
     pred_label = (
@@ -536,17 +602,22 @@ def _build_card(
     aes_str = f"{aes:.2f}" if aes is not None else "-"
     coverage_str = f"{round(coverage * 100)}%" if coverage is not None else "-"
 
+    source_type = "image" if is_image_source else "video"
+    badge_html = "" if is_image_source else VIDEO_BADGE_HTML
+
     return f"""<div class="photo-card"
      data-export-path="{html.escape(export_path)}"
+     data-source-type="{source_type}"
      data-pred-label="{html.escape(pred_label_attr)}"
      data-pred-confidence="{pred_conf_attr}"
      data-aesthetic="{aes_attr}"
      data-coverage="{coverage_attr}"
      data-aspect="{aspect:.4f}"
-     data-roll="{roll:.1f}"
+     data-rotation="{rotation}"
      data-video-stem="{html.escape(video_stem)}"
      data-flagged="false">
   <button class="flag-btn" title="Toggle flag (space in lightbox)">Flag</button>
+  {badge_html}
   <img src="{thumb_src}" loading="lazy" alt="">
   <div class="overlay">
     <div>pred: {html.escape(pred_str)}  |  aes: {aes_str}  |  coverage: {coverage_str}</div>
@@ -631,17 +702,18 @@ def main() -> None:
 
         thumb_src = _make_img_src(refined_p, html_dir)
 
-        roll = _compute_roll(row.get("kps"))
+        # Image-source cards read EXIF orientation from the original file.
+        # Video-source cards already have rotation baked into the JPEG by
+        # pass1_index.py, so they always render at 0 degrees here.
+        rotation = get_image_rotation_deg(video_path) if is_image_source else 0
         fw = _safe_float(row.get("frame_w"))
         fh = _safe_float(row.get("frame_h"))
         if fw and fh and fw > 0 and fh > 0:
-            aspect = fw / fh
-            if abs(roll) > 45:
-                aspect = fh / fw
+            aspect = (fh / fw) if rotation in (90, 270) else (fw / fh)
         else:
             aspect = 1.0
 
-        cards.append(_build_card(row, thumb_src, export_path, aspect, roll))
+        cards.append(_build_card(row, thumb_src, export_path, aspect, rotation, is_image_source))
 
     if skipped:
         logger.info("Skipped %d rows (missing video_path or thumbnail)", skipped)
@@ -654,6 +726,7 @@ def main() -> None:
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=1400">
 <title>Still Extractor - Photos</title>
 <style>{CSS}</style>
 </head>
@@ -667,6 +740,11 @@ def main() -> None:
     <button class="filter-btn" data-filter="okay">Okay</button>
     <button class="filter-btn" data-filter="bad">Bad</button>
     <button class="filter-btn" data-filter="none">None</button>
+    <span class="toolbar-sep">|</span>
+    <span class="toolbar-label">Source:</span>
+    <button class="source-filter-btn" data-source-filter="all">All</button>
+    <button class="source-filter-btn" data-source-filter="video">Video</button>
+    <button class="source-filter-btn" data-source-filter="image">Image</button>
     <span class="toolbar-sep">|</span>
     <span class="toolbar-label">Sort:</span>
     <button class="sort-btn" data-sort="confidence">Pred Confidence &darr;</button>

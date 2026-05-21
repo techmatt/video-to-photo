@@ -3,6 +3,8 @@
 import csv
 import json
 import logging
+import math
+import struct
 import sys
 import time
 from argparse import ArgumentParser
@@ -119,6 +121,130 @@ def _bbox_area(bbox: np.ndarray) -> float:
     return float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
 
 
+# ---------------------------------------------------------------------------
+# Video display-matrix rotation
+#
+# PyAV 17 / current ffmpeg builds no longer expose `stream.metadata["rotate"]`
+# or display-matrix side data. iPhone clips encode rotation in the QuickTime
+# tkhd display matrix, so we read the box tree directly.
+
+_MOOV_SCAN_BYTES = 8 * 1024 * 1024  # bytes to scan from each end of file
+
+
+def _read_atom_header(buf: bytes, i: int, end: int):
+    if i + 8 > end:
+        return None
+    size = struct.unpack(">I", buf[i:i + 4])[0]
+    atype = buf[i + 4:i + 8]
+    header = 8
+    if size == 1:
+        if i + 16 > end:
+            return None
+        size = struct.unpack(">Q", buf[i + 8:i + 16])[0]
+        header = 16
+    elif size == 0:
+        size = end - i
+    if size < header or i + size > end:
+        return None
+    return atype, header, size
+
+
+def _iter_children(buf: bytes, start: int, end: int):
+    i = start
+    while i < end:
+        h = _read_atom_header(buf, i, end)
+        if h is None:
+            return
+        atype, header, size = h
+        yield atype, i + header, i + size
+        i += size
+
+
+def _find_boxes(buf: bytes, start: int, end: int, want: bytes, recurse_into=None):
+    for atype, bstart, bend in _iter_children(buf, start, end):
+        if atype == want:
+            yield bstart, bend
+        elif recurse_into and atype in recurse_into:
+            yield from _find_boxes(buf, bstart, bend, want, recurse_into)
+
+
+def _moov_buffer(path: Path) -> bytes | None:
+    """Return enough bytes to cover the moov atom (head, or tail for iPhone files)."""
+    sz = path.stat().st_size
+    with open(path, "rb") as f:
+        head_len = min(sz, _MOOV_SCAN_BYTES)
+        head = f.read(head_len)
+        # If moov lives at the start, we already have it
+        if any(True for _ in _find_boxes(head, 0, len(head), b"moov")):
+            return head
+        # Otherwise read the tail (iPhone mdat-first layout)
+        tail_len = min(sz, _MOOV_SCAN_BYTES)
+        f.seek(sz - tail_len)
+        tail = f.read()
+        # Linear search for the moov magic and align to its 4-byte size prefix
+        magic = tail.find(b"moov")
+        if magic < 4:
+            return None
+        return tail[magic - 4:]
+
+
+def get_video_rotation(path: Path) -> int:
+    """Return clockwise rotation (0/90/180/270) for the video track, 0 if none."""
+    try:
+        buf = _moov_buffer(path)
+        if buf is None:
+            return 0
+        for mstart, mend in _find_boxes(buf, 0, len(buf), b"moov"):
+            for tstart, tend in _find_boxes(buf, mstart, mend, b"trak"):
+                handler_type = None
+                for hstart, hend in _find_boxes(
+                    buf, tstart, tend, b"hdlr", recurse_into={b"mdia"},
+                ):
+                    body = buf[hstart:hend]
+                    if len(body) >= 16:
+                        handler_type = body[8:12]
+                    break
+                if handler_type != b"vide":
+                    continue
+                for kstart, kend in _find_boxes(buf, tstart, tend, b"tkhd"):
+                    body = buf[kstart:kend]
+                    if not body:
+                        continue
+                    version = body[0]
+                    # tkhd body layout: 4 (FullBox) + 20 (v0) or 32 (v1) + 8
+                    # reserved + 8 (layer/alt_group/volume/reserved) -> matrix
+                    matrix_offset = 40 if version == 0 else 52
+                    if len(body) < matrix_offset + 36:
+                        continue
+                    m = struct.unpack(">9i", body[matrix_offset:matrix_offset + 36])
+                    a = m[0] / 65536.0
+                    b = m[1] / 65536.0
+                    if abs(a) < 1e-6 and abs(b) < 1e-6:
+                        # degenerate matrix; treat as no rotation
+                        return 0
+                    # atan2(b, a) is the clockwise rotation that the display
+                    # matrix applies to the raw decoded frame
+                    deg = math.degrees(math.atan2(b, a))
+                    return int(round(deg / 90)) * 90 % 360
+    except Exception as e:
+        logger.warning("Failed to read rotation for %s: %s", path.name, e)
+    return 0
+
+
+_CV2_ROTATE_FOR_DEG = {
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
+def _apply_rotation(img: np.ndarray, rotation_deg: int) -> np.ndarray:
+    flag = _CV2_ROTATE_FOR_DEG.get(rotation_deg)
+    if flag is None:
+        return img
+    return cv2.rotate(img, flag)
+
+
 def _video_duration_seconds(container: "av.container.InputContainer", stream) -> float | None:
     if stream.duration is not None and stream.time_base is not None:
         return float(stream.duration * stream.time_base)
@@ -128,7 +254,12 @@ def _video_duration_seconds(container: "av.container.InputContainer", stream) ->
 
 
 def sample_frames(video_path: Path, fps: float):
-    """Yield (frame_index, timestamp_seconds, bgr_array) by seeking across the full duration."""
+    """Yield (frame_index, timestamp_seconds, bgr_array) by seeking across the full duration.
+
+    Frames are rotated according to the QuickTime tkhd display matrix so the
+    yielded ndarray is already in correct display orientation.
+    """
+    rotation = get_video_rotation(video_path)
     container = av.open(str(video_path))
     try:
         stream = container.streams.video[0]
@@ -176,13 +307,19 @@ def sample_frames(video_path: Path, fps: float):
             last_pts = chosen.pts
             actual_sec = float(chosen.pts * time_base)
             img = chosen.to_ndarray(format="bgr24")
+            img = _apply_rotation(img, rotation)
             yield i, actual_sec, img
     finally:
         container.close()
 
 
 def sample_frames_windowed(video_path: Path, fps: float, windows: list[int]):
-    """Yield (frame_index, timestamp_seconds, bgr_array) within [t, t+1.0) for each t in windows."""
+    """Yield (frame_index, timestamp_seconds, bgr_array) within [t, t+1.0) for each t in windows.
+
+    Frames are rotated according to the QuickTime tkhd display matrix so the
+    yielded ndarray is already in correct display orientation.
+    """
+    rotation = get_video_rotation(video_path)
     container = av.open(str(video_path))
     try:
         stream = container.streams.video[0]
@@ -229,7 +366,9 @@ def sample_frames_windowed(video_path: Path, fps: float, windows: list[int]):
 
                 last_pts = chosen.pts
                 actual_sec = float(chosen.pts * time_base)
-                yield idx, actual_sec, chosen.to_ndarray(format="bgr24")
+                img = chosen.to_ndarray(format="bgr24")
+                img = _apply_rotation(img, rotation)
+                yield idx, actual_sec, img
                 idx += 1
     finally:
         container.close()
