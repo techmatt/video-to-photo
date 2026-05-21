@@ -8,7 +8,9 @@ repo-root-relative paths for the rejected set.
 import html
 import json
 import logging
+import random
 from argparse import ArgumentParser
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -325,6 +327,10 @@ def main() -> None:
                         help="Directory to crawl recursively for *.jpg frames.")
     parser.add_argument("--output-html", type=Path, required=True,
                         help="Path to write the self-contained HTML file.")
+    parser.add_argument("--max-per-video", type=int, default=5,
+                        help="Max frames sampled per source video (parent dir). Default: 5.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for per-video sampling. Default: 42.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -352,11 +358,31 @@ def main() -> None:
     )
     logger.info("Found %d JPEG files under %s", len(files), abs_frames_dir)
 
+    groups: dict[str, list[Path]] = defaultdict(list)
+    for fp in files:
+        groups[fp.parent.name].append(fp)
+    num_videos = len(groups)
+    logger.info("Grouped into %d source videos", num_videos)
+
+    rng = random.Random(args.seed)
+    sampled: list[Path] = []
+    for video_stem in sorted(groups.keys()):
+        group_files = groups[video_stem]
+        k = min(len(group_files), args.max_per_video)
+        picked = rng.sample(group_files, k) if k < len(group_files) else list(group_files)
+        sampled.extend(picked)
+    sampled.sort(key=lambda p: (p.parent.name, p.name))
+    logger.info(
+        "Sampled %d / %d frames (up to %d per video across %d videos)",
+        len(sampled), len(files), args.max_per_video, num_videos,
+    )
+
     frames: list[dict] = []
+    sampled_paths: list[str] = []
     skipped = 0
-    for i, fp in enumerate(files):
+    for i, fp in enumerate(sampled):
         if i % 1000 == 0 and i > 0:
-            logger.info("Read %d / %d aspect ratios", i, len(files))
+            logger.info("Read %d / %d aspect ratios", i, len(sampled))
         aspect = _read_aspect(fp)
         if aspect is None:
             skipped += 1
@@ -371,25 +397,42 @@ def main() -> None:
             export_rel = fp.relative_to(repo_root)
         except ValueError:
             export_rel = fp
+        export_path_str = _to_fwd_slash(export_rel)
         frames.append({
             "s": quote(_to_fwd_slash(src_rel)),
-            "p": _to_fwd_slash(export_rel),
+            "p": export_path_str,
             "a": round(aspect, 4),
         })
+        sampled_paths.append(export_path_str)
 
     if skipped:
         logger.info("Skipped %d files (unreadable or outside html dir)", skipped)
+
+    frames_json_path = output_html.parent / "uprighter_frames.json"
+    frames_json_path.write_text(
+        json.dumps(sorted(sampled_paths), indent=2),
+        encoding="utf-8",
+    )
+    logger.info("Wrote %s (%d paths)", frames_json_path, len(sampled_paths))
+
     logger.info("Embedding %d frames into %s", len(frames), output_html)
 
     frames_json = json.dumps(frames, separators=(",", ":"))
-    title_text = f"Uprighter Review &mdash; {len(frames)} frames"
+    title_text = (
+        f"Uprighter Review &mdash; {len(frames)} frames "
+        f"({num_videos} videos, up to {args.max_per_video} per video)"
+    )
+    title_plain = (
+        f"Uprighter Review - {len(frames)} frames "
+        f"({num_videos} videos, up to {args.max_per_video} per video)"
+    )
 
     body = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=1400">
-<title>{html.escape(f"Uprighter Review - {len(frames)} frames")}</title>
+<title>{html.escape(title_plain)}</title>
 <style>{CSS}</style>
 </head>
 <body>
@@ -427,9 +470,14 @@ const FRAMES = {frames_json};
         "stage": "build_uprighter_review",
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "frame_count": len(frames),
+        "total_crawled": len(files),
+        "num_videos": num_videos,
+        "max_per_video": args.max_per_video,
+        "seed": args.seed,
         "skipped": skipped,
         "frames_dir": str(frames_dir),
         "output_html": str(output_html),
+        "frames_json": str(frames_json_path),
         "file_size_mb": round(file_size_mb, 2),
     }
     summary_path = output_html.parent / "build_uprighter_review_summary.json"
