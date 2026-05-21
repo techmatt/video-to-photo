@@ -98,7 +98,7 @@ def main() -> None:
                         help="Path to labels.json (keys: '{stem}/{kept_filename}').")
     parser.add_argument("--results", type=Path, default=None,
                         help="Path to results.parquet with kept_path + face bbox.")
-    parser.add_argument("--output-dir", type=Path, default=Path("labels"),
+    parser.add_argument("--output-dir", type=Path, default=Path("data/face_labels"),
                         help="Output directory (will contain faces/ and labels.json).")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])

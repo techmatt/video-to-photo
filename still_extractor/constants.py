@@ -27,6 +27,6 @@ IMAGENET_MEAN: tuple[float, float, float] = (0.485, 0.456, 0.406)
 IMAGENET_STD: tuple[float, float, float] = (0.229, 0.224, 0.225)
 
 
-def card_key(video_stem: str, frame_path: "str | Path") -> str:
+def card_key(video_stem: str, kept_path: "str | Path") -> str:
     """Stable join key between Python pipeline and browser label store."""
-    return f"{video_stem}/{Path(frame_path).name}"
+    return f"{video_stem}/{Path(kept_path).name}"
