@@ -22,14 +22,19 @@ import torchvision.transforms as T
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
+from still_extractor.constants import (
+    DEFAULT_UPRIGHTER_MODEL,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    UPRIGHTER_INPUT_SIZE,
+)
+
 logger = logging.getLogger(__name__)
 
 
 N_CLASSES = 4
-IMAGE_SIZE = 224
+IMAGE_SIZE = UPRIGHTER_INPUT_SIZE
 CACHE_MAX_DIM = 256  # All sources pre-decoded + downsized to max-dim 256 in RAM.
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
 ROTATION_LABELS = [0, 90, 180, 270]
 
 
@@ -342,7 +347,7 @@ def main() -> None:
     parser.add_argument("--rejected-json", type=Path,
                         default=Path("labels/rejected.json"))
     parser.add_argument("--output-dir", type=Path,
-                        default=Path("models/uprighter"))
+                        default=DEFAULT_UPRIGHTER_MODEL.parent)
     parser.add_argument("--repo-root", type=Path, default=Path("."))
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr-phase1", type=float, default=1e-3)

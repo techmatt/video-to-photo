@@ -18,24 +18,13 @@ from pathlib import Path
 import pandas as pd
 from PIL import Image
 
+from still_extractor.constants import card_key
+from still_extractor.utils import safe_float as _safe_float, to_fwd_slash as _to_fwd_slash
+
 logger = logging.getLogger(__name__)
 
 
 LABEL_TITLE_CASE = {"good": "Good", "okay": "Okay", "bad": "Bad", "none": "None"}
-
-
-def _to_fwd_slash(p: str | Path) -> str:
-    return str(p).replace("\\", "/")
-
-
-def _safe_float(v) -> float | None:
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    if pd.isna(f):
-        return None
-    return f
 
 
 def _safe_str(v) -> str | None:
@@ -55,7 +44,7 @@ def _row_card_key(row: pd.Series) -> str | None:
     chosen = refined if refined is not None else frame_path
     if chosen is None:
         return None
-    return f"{stem}/{Path(chosen).name}"
+    return card_key(stem, chosen)
 
 
 def _resolve_image_for_row(row: pd.Series) -> Path | None:

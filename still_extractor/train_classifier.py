@@ -26,19 +26,25 @@ from sklearn.model_selection import StratifiedShuffleSplit
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
-from still_extractor.build_index_html import _parse_kps
+from still_extractor.constants import (
+    DEFAULT_FACE_QUALITY_MODEL,
+    FACE_CROP_PADDING,
+    FACE_QUALITY_INPUT_SIZE,
+    FACE_QUALITY_LABELS,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    LABEL_TO_IDX,
+    card_key,
+)
 from still_extractor.face_crop import extract_face_crop
+from still_extractor.utils import parse_kps
 
 logger = logging.getLogger(__name__)
 
 
-LABEL_TO_IDX = {"none": 0, "bad": 1, "okay": 2, "good": 3}
 IDX_TO_LABEL = {v: k for k, v in LABEL_TO_IDX.items()}
-N_CLASSES = 4
-FACE_CROP_PADDING = 20
-DISPLAY_SIZE = 128
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
+N_CLASSES = len(FACE_QUALITY_LABELS)
+DISPLAY_SIZE = FACE_QUALITY_INPUT_SIZE
 
 
 class JpegRecompress:
@@ -93,10 +99,10 @@ def _row_key(row: pd.Series) -> str | None:
         return None
     refined = row.get("refined_frame_path")
     if isinstance(refined, str) and refined:
-        return f"{stem}/{Path(refined).name}"
+        return card_key(stem, refined)
     raw = row.get("frame_path")
     if isinstance(raw, str) and raw:
-        return f"{stem}/{Path(raw).name}"
+        return card_key(stem, raw)
     return None
 
 
@@ -115,7 +121,7 @@ def _crop_for_row(row: pd.Series) -> Image.Image | None:
             img_path,
             row["face_x1"], row["face_y1"], row["face_x2"], row["face_y2"],
             FACE_CROP_PADDING,
-            kps=_parse_kps(row.get("kps")),
+            kps=parse_kps(row.get("kps")),
         )
     except Exception as e:
         logger.warning("Failed to crop %s: %s", img_path, e)
@@ -297,7 +303,7 @@ def main() -> None:
     parser.add_argument("--labels-json", type=Path,
                         default=Path("save/labels.json"))
     parser.add_argument("--output-dir", type=Path,
-                        default=Path("models/face_quality"))
+                        default=DEFAULT_FACE_QUALITY_MODEL.parent)
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=32)

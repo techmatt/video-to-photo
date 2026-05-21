@@ -18,12 +18,11 @@ import pillow_heif
 import yaml
 from tqdm import tqdm
 
+from still_extractor.constants import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+
 pillow_heif.register_heif_opener()
 
 logger = logging.getLogger(__name__)
-
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".bmp"}
 
 MANIFEST_COLUMNS = [
     "file_path",

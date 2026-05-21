@@ -17,11 +17,9 @@ from urllib.parse import quote
 
 from PIL import Image
 
+from still_extractor.utils import to_fwd_slash as _to_fwd_slash
+
 logger = logging.getLogger(__name__)
-
-
-def _to_fwd_slash(p: str | Path) -> str:
-    return str(p).replace("\\", "/")
 
 
 CSS = """

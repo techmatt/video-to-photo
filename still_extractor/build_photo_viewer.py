@@ -11,32 +11,18 @@ from urllib.parse import quote
 import pandas as pd
 from PIL import ExifTags, Image
 
+from still_extractor.constants import IMAGE_EXTENSIONS
 from still_extractor.inventory import RunConfig
+from still_extractor.utils import safe_float as _safe_float, to_fwd_slash as _to_fwd_slash
 
 logger = logging.getLogger(__name__)
 
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".bmp"}
 
 _EXIF_ORIENTATION_TAG = next(
     k for k, v in ExifTags.TAGS.items() if v == "Orientation"
 )
 # EXIF orientation tag -> clockwise rotation needed for correct display
 _EXIF_ORIENTATION_TO_DEG = {1: 0, 3: 180, 6: 90, 8: 270}
-
-
-def _safe_float(v) -> float | None:
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    if pd.isna(f):
-        return None
-    return f
-
-
-def _to_fwd_slash(p: str | Path) -> str:
-    return str(p).replace("\\", "/")
 
 
 def get_image_rotation_deg(image_path: str | Path) -> int:
