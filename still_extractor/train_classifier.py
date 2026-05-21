@@ -2,7 +2,7 @@
 
 Backbone: MobileNetV3-Small (ImageNet pretrained), trained in two phases —
 first the classifier head only, then the last InvertedResidual block plus
-the head. After training, runs inference on the full corpus (refined_scores.csv)
+the head. After training, runs inference on the full corpus (results.parquet)
 with and without 5-pass test-time augmentation, and writes soft labels to CSV.
 """
 
@@ -36,7 +36,8 @@ from still_extractor.constants import (
     LABEL_TO_IDX,
     card_key,
 )
-from still_extractor.face_crop import extract_face_crop
+from still_extractor.face_crop import extract_face_crop_from_image
+from still_extractor.inventory import RunConfig
 from still_extractor.utils import parse_kps
 
 logger = logging.getLogger(__name__)
@@ -97,28 +98,23 @@ def _row_key(row: pd.Series) -> str | None:
     stem = row.get("video_stem")
     if not isinstance(stem, str) or not stem:
         return None
-    refined = row.get("refined_frame_path")
-    if isinstance(refined, str) and refined:
-        return card_key(stem, refined)
-    raw = row.get("frame_path")
-    if isinstance(raw, str) and raw:
-        return card_key(stem, raw)
+    kept = row.get("kept_path")
+    if isinstance(kept, str) and kept:
+        return card_key(stem, kept)
     return None
 
 
 def _crop_for_row(row: pd.Series) -> Image.Image | None:
-    refined = row.get("refined_frame_path")
-    raw = row.get("frame_path")
-    img_path: Path | None = None
-    if isinstance(refined, str) and refined and Path(refined).exists():
-        img_path = Path(refined)
-    elif isinstance(raw, str) and raw and Path(raw).exists():
-        img_path = Path(raw)
-    if img_path is None:
+    kept = row.get("kept_path")
+    if not isinstance(kept, str) or not kept:
+        return None
+    img_path = Path(kept)
+    if not img_path.exists():
         return None
     try:
-        crop = extract_face_crop(
-            img_path,
+        img = Image.open(img_path).convert("RGB")
+        crop = extract_face_crop_from_image(
+            img,
             row["face_x1"], row["face_y1"], row["face_x2"], row["face_y2"],
             FACE_CROP_PADDING,
             kps=parse_kps(row.get("kps")),
@@ -298,8 +294,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train face quality classifier and run inference on the full corpus.",
     )
-    parser.add_argument("--scores-csv", type=Path,
-                        default=Path("data/mini/refined_scores.csv"))
+    parser.add_argument("--config", type=Path, default=None,
+                        help="Run YAML config. When provided, --results defaults "
+                             "to {output_dir}/results.parquet. Explicit flag still overrides.")
+    parser.add_argument("--results", type=Path, default=None,
+                        help="Path to results.parquet from the pipeline.")
     parser.add_argument("--labels-json", type=Path,
                         default=Path("save/labels.json"))
     parser.add_argument("--output-dir", type=Path,
@@ -320,6 +319,13 @@ def main() -> None:
         force=True,
     )
 
+    if args.config is not None:
+        cfg = RunConfig.from_yaml(args.config)
+        if args.results is None:
+            args.results = cfg.output_dir / "results.parquet"
+    if args.results is None:
+        parser.error("--results is required when --config is not provided")
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -331,10 +337,10 @@ def main() -> None:
     logger.info("Using device: %s", device)
 
     labels_raw = json.loads(args.labels_json.read_text(encoding="utf-8"))
-    df = pd.read_csv(args.scores_csv).reset_index(drop=True)
+    df = pd.read_parquet(args.results).reset_index(drop=True)
     logger.info(
-        "Loaded %d scored rows from %s, %d labels from %s",
-        len(df), args.scores_csv, len(labels_raw), args.labels_json,
+        "Loaded %d keeper rows from %s, %d labels from %s",
+        len(df), args.results, len(labels_raw), args.labels_json,
     )
 
     keys: list[str | None] = [_row_key(df.iloc[i]) for i in range(len(df))]
@@ -543,11 +549,11 @@ def main() -> None:
     out.to_csv(inference_path, index=False)
     logger.info("Wrote %s (%d rows)", inference_path, len(out))
 
-    # Also write alongside the scores CSV so the HTML builder finds it by default.
-    scores_inference_path = args.scores_csv.parent / "classifier" / "inference_scores.csv"
-    scores_inference_path.parent.mkdir(parents=True, exist_ok=True)
-    out.to_csv(scores_inference_path, index=False)
-    logger.info("Wrote %s (%d rows)", scores_inference_path, len(out))
+    # Also write alongside results.parquet for convenience.
+    results_inference_path = args.results.parent / "classifier" / "inference_scores.csv"
+    results_inference_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(results_inference_path, index=False)
+    logger.info("Wrote %s (%d rows)", results_inference_path, len(out))
 
     nonempty_preds = [p for p in pred_labels if p]
     pred_counts = pd.Series(nonempty_preds).value_counts().to_dict()

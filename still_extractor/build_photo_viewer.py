@@ -618,20 +618,17 @@ def _build_card(
 
 def main() -> None:
     parser = ArgumentParser(
-        description="Build a self-contained HTML photo viewer for refined frames.",
+        description="Build a self-contained HTML photo viewer for pipeline keepers.",
     )
     parser.add_argument("--config", type=Path, default=None,
-                        help="Run YAML config. When provided, --scores-csv, "
-                             "--output-html and --parquet default to "
-                             "{output_dir}/refined_scores.csv, "
-                             "{output_dir}/index_photos.html and "
-                             "{output_dir}/index.parquet. Explicit flags still override.")
-    parser.add_argument("--scores-csv", type=Path, default=None,
-                        help="Path to refined_scores.csv.")
+                        help="Run YAML config. When provided, --results and "
+                             "--output-html default to {output_dir}/results.parquet "
+                             "and {output_dir}/index_photos.html. Explicit flags "
+                             "still override.")
+    parser.add_argument("--results", type=Path, default=None,
+                        help="Path to results.parquet.")
     parser.add_argument("--output-html", type=Path, default=None,
                         help="Path to write the HTML file.")
-    parser.add_argument("--parquet", type=Path, default=None,
-                        help="Pass 1 index parquet (for video_path / frame_w / frame_h).")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -644,35 +641,17 @@ def main() -> None:
 
     if args.config is not None:
         cfg = RunConfig.from_yaml(args.config)
-        if args.scores_csv is None:
-            args.scores_csv = cfg.output_dir / "refined_scores.csv"
+        if args.results is None:
+            args.results = cfg.output_dir / "results.parquet"
         if args.output_html is None:
             args.output_html = cfg.output_dir / "index_photos.html"
-        if args.parquet is None:
-            args.parquet = cfg.output_dir / "index.parquet"
-    if args.scores_csv is None or args.output_html is None or args.parquet is None:
+    if args.results is None or args.output_html is None:
         parser.error(
-            "--scores-csv, --output-html, and --parquet are required when "
-            "--config is not provided",
+            "--results and --output-html are required when --config is not provided",
         )
 
-    df = pd.read_csv(args.scores_csv)
-    logger.info("Loaded %d rows from %s", len(df), args.scores_csv)
-
-    idx = pd.read_parquet(
-        args.parquet, columns=["frame_path", "video_path", "frame_w", "frame_h"],
-    )
-    logger.info("Loaded %d rows from %s", len(idx), args.parquet)
-
-    # Replace any pre-existing copies of these columns with the parquet values.
-    drop_cols = [c for c in ["video_path", "frame_w", "frame_h"] if c in df.columns]
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
-    df = df.merge(idx, on="frame_path", how="left")
-
-    missing = df["video_path"].isna().sum()
-    if missing:
-        logger.warning("%d rows have no parquet match on frame_path", int(missing))
+    df = pd.read_parquet(args.results)
+    logger.info("Loaded %d rows from %s", len(df), args.results)
 
     face_h = df["face_y2"] - df["face_y1"]
     df["face_coverage"] = (
@@ -692,15 +671,13 @@ def main() -> None:
             continue
         is_image_source = Path(video_path).suffix.lower() in IMAGE_EXTENSIONS
 
-        refined = row.get("refined_frame_path")
-        if not isinstance(refined, str) or not refined or pd.isna(refined):
-            refined = row.get("frame_path", "")
-        if not isinstance(refined, str) or not refined:
+        kept = row.get("kept_path")
+        if not isinstance(kept, str) or not kept or pd.isna(kept):
             skipped += 1
             continue
-        refined_p = Path(refined)
-        if not refined_p.exists():
-            logger.warning("Thumbnail missing on disk: %s", refined_p)
+        kept_p = Path(kept)
+        if not kept_p.exists():
+            logger.warning("Keeper missing on disk: %s", kept_p)
             skipped += 1
             continue
 
@@ -708,13 +685,13 @@ def main() -> None:
             export_path = _to_fwd_slash(video_path)
             image_source_count += 1
         else:
-            export_path = _to_fwd_slash(refined_p.resolve())
+            export_path = _to_fwd_slash(kept_p.resolve())
 
-        thumb_src = _make_img_src(refined_p, html_dir)
+        thumb_src = _make_img_src(kept_p, html_dir)
 
         # Image-source cards read EXIF orientation from the original file.
-        # Video-source cards already have rotation baked into the JPEG by
-        # pass1_index.py, so they always render at 0 degrees here.
+        # Video-source keepers already have rotation baked into the JPEG by
+        # the pipeline worker, so they always render at 0 degrees here.
         rotation = get_image_rotation_deg(video_path) if is_image_source else 0
         fw = _safe_float(row.get("frame_w"))
         fh = _safe_float(row.get("frame_h"))
@@ -726,7 +703,7 @@ def main() -> None:
         cards.append(_build_card(row, thumb_src, export_path, aspect, rotation, is_image_source))
 
     if skipped:
-        logger.info("Skipped %d rows (missing video_path or thumbnail)", skipped)
+        logger.info("Skipped %d rows (missing video_path or keeper)", skipped)
     logger.info(
         "Built %d cards (%d image-source, %d video-source)",
         len(cards), image_source_count, len(cards) - image_source_count,

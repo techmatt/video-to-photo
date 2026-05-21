@@ -1,11 +1,9 @@
 """Export face crops for each labeled frame in labels.json.
 
-Reads `save/labels.json` (keys `{video_stem}/{frame_filename}` -> `good|okay|bad|none`),
-joins against `refined_scores.csv` to recover `(video_path, timestamp_s, refined_frame_path,
-face bbox)`, crops the face from the frame JPEG, and writes a self-contained
-`labels/` folder.
-
-Standalone: only uses pandas + Pillow + stdlib.
+Reads `save/labels.json` (keys `{video_stem}/{kept_filename}` -> `good|okay|bad|none`),
+joins against `results.parquet` to recover `(video_path, timestamp_s, kept_path,
+face bbox, kps)`, crops the face from the keeper JPEG using the same roll-corrected
+crop the labeling UI showed, and writes a self-contained `labels/` folder.
 """
 
 import argparse
@@ -18,8 +16,14 @@ from pathlib import Path
 import pandas as pd
 from PIL import Image
 
-from still_extractor.constants import card_key
-from still_extractor.utils import safe_float as _safe_float, to_fwd_slash as _to_fwd_slash
+from still_extractor.constants import FACE_CROP_PADDING, card_key
+from still_extractor.face_crop import extract_face_crop_from_image
+from still_extractor.inventory import RunConfig
+from still_extractor.utils import (
+    parse_kps,
+    safe_float as _safe_float,
+    to_fwd_slash as _to_fwd_slash,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,51 +38,26 @@ def _safe_str(v) -> str | None:
 
 
 def _row_card_key(row: pd.Series) -> str | None:
-    """Match the key build_index_html.py uses: `{video_stem}/{Path(frame_col).name}`,
-    where `frame_col` is `refined_frame_path` if present-and-nonempty, else `frame_path`."""
+    """Match the key build_faces_review.py uses: `{video_stem}/{Path(kept_path).name}`."""
     stem = _safe_str(row.get("video_stem"))
-    if not stem:
+    kept = _safe_str(row.get("kept_path"))
+    if stem is None or kept is None:
         return None
-    refined = _safe_str(row.get("refined_frame_path"))
-    frame_path = _safe_str(row.get("frame_path"))
-    chosen = refined if refined is not None else frame_path
-    if chosen is None:
-        return None
-    return card_key(stem, chosen)
-
-
-def _resolve_image_for_row(row: pd.Series) -> Path | None:
-    refined = _safe_str(row.get("refined_frame_path"))
-    if refined is not None:
-        rp = Path(refined)
-        if rp.exists():
-            return rp
-        logger.warning("refined_frame_path missing on disk: %s", rp)
-    frame_path = _safe_str(row.get("frame_path"))
-    if frame_path is not None:
-        fp = Path(frame_path)
-        if fp.exists():
-            return fp
-        logger.warning("frame_path missing on disk: %s", fp)
-    return None
+    return card_key(stem, kept)
 
 
 def _crop_face(img: Image.Image, row: pd.Series) -> Image.Image:
-    """Crop to the parquet face bbox. If bbox is invalid, return the full image."""
+    """Crop to the parquet face bbox with padding and kps-based roll correction.
+    If bbox is invalid, return the full image."""
     x1 = _safe_float(row.get("face_x1"))
     y1 = _safe_float(row.get("face_y1"))
     x2 = _safe_float(row.get("face_x2"))
     y2 = _safe_float(row.get("face_y2"))
     if None in (x1, y1, x2, y2):
         return img
-    w, h = img.size
-    cx1 = max(0, int(x1))
-    cy1 = max(0, int(y1))
-    cx2 = min(w, int(x2))
-    cy2 = min(h, int(y2))
-    if cx2 <= cx1 or cy2 <= cy1:
-        return img
-    return img.crop((cx1, cy1, cx2, cy2))
+    return extract_face_crop_from_image(
+        img, x1, y1, x2, y2, FACE_CROP_PADDING, kps=parse_kps(row.get("kps")),
+    )
 
 
 def _sha256_hex(data: bytes) -> str:
@@ -91,11 +70,11 @@ def _atomic_write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
-def build_lookup(scores_df: pd.DataFrame) -> dict[str, int]:
-    """Map `{stem}/{frame_filename}` -> row index in scores_df."""
+def build_lookup(results_df: pd.DataFrame) -> dict[str, int]:
+    """Map `{stem}/{kept_filename}` -> row index in results_df."""
     lookup: dict[str, int] = {}
     collisions = 0
-    for idx, row in scores_df.iterrows():
+    for idx, row in results_df.iterrows():
         key = _row_card_key(row)
         if key is None:
             continue
@@ -104,7 +83,7 @@ def build_lookup(scores_df: pd.DataFrame) -> dict[str, int]:
             continue
         lookup[key] = idx
     if collisions:
-        logger.warning("%d duplicate card keys in scores CSV; kept first occurrence", collisions)
+        logger.warning("%d duplicate card keys in results.parquet; kept first occurrence", collisions)
     return lookup
 
 
@@ -112,12 +91,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Export face crops for labeled frames listed in labels.json.",
     )
+    parser.add_argument("--config", type=Path, default=None,
+                        help="Run YAML config. When provided, --results defaults to "
+                             "{output_dir}/results.parquet. Explicit flag still overrides.")
     parser.add_argument("--labels-json", type=Path, default=Path("save/labels.json"),
-                        help="Path to labels.json (keys: '{stem}/{frame_filename}').")
-    parser.add_argument("--parquet", type=Path, default=Path("data/mini/index.parquet"),
-                        help="Pass 1 index parquet (schema printed for reference).")
-    parser.add_argument("--scores-csv", type=Path, default=Path("data/mini/refined_scores.csv"),
-                        help="refined_scores.csv with refined_frame_path + face bbox.")
+                        help="Path to labels.json (keys: '{stem}/{kept_filename}').")
+    parser.add_argument("--results", type=Path, default=None,
+                        help="Path to results.parquet with kept_path + face bbox.")
     parser.add_argument("--output-dir", type=Path, default=Path("labels"),
                         help="Output directory (will contain faces/ and labels.json).")
     parser.add_argument("--log-level", default="INFO",
@@ -130,18 +110,20 @@ def main() -> None:
         force=True,
     )
 
+    if args.config is not None:
+        cfg = RunConfig.from_yaml(args.config)
+        if args.results is None:
+            args.results = cfg.output_dir / "results.parquet"
+    if args.results is None:
+        parser.error("--results is required when --config is not provided")
+
     labels_in = json.loads(args.labels_json.read_text(encoding="utf-8"))
     logger.info("Loaded %d labels from %s", len(labels_in), args.labels_json)
 
-    parquet_df = pd.read_parquet(args.parquet)
-    logger.info("Parquet %s: %d rows", args.parquet, len(parquet_df))
-    logger.info("Parquet columns: %s", list(parquet_df.columns))
-    logger.info("Parquet dtypes:\n%s", parquet_df.dtypes.to_string())
+    results_df = pd.read_parquet(args.results)
+    logger.info("Results parquet %s: %d rows", args.results, len(results_df))
 
-    scores_df = pd.read_csv(args.scores_csv)
-    logger.info("Scores CSV %s: %d rows", args.scores_csv, len(scores_df))
-
-    lookup = build_lookup(scores_df)
+    lookup = build_lookup(results_df)
     logger.info("Built lookup with %d unique card keys", len(lookup))
 
     faces_dir = args.output_dir / "faces"
@@ -161,7 +143,7 @@ def main() -> None:
         if row_idx is None:
             missed.append(key)
             continue
-        row = scores_df.iloc[row_idx]
+        row = results_df.iloc[row_idx]
 
         video_path = _safe_str(row.get("video_path"))
         stem = _safe_str(row.get("video_stem")) or ""
@@ -171,9 +153,14 @@ def main() -> None:
             missed.append(key)
             continue
 
-        img_path = _resolve_image_for_row(row)
-        if img_path is None:
-            logger.warning("Skipping %s: no readable frame image", key)
+        kept = _safe_str(row.get("kept_path"))
+        if kept is None:
+            logger.warning("Skipping %s: missing kept_path", key)
+            skipped_image.append(key)
+            continue
+        img_path = Path(kept)
+        if not img_path.exists():
+            logger.warning("Skipping %s: kept_path missing on disk: %s", key, img_path)
             skipped_image.append(key)
             continue
 
@@ -213,7 +200,7 @@ def main() -> None:
     matched = total - len(missed)
     logger.info("=" * 60)
     logger.info("Total in labels.json: %d", total)
-    logger.info("Matched to a scores-CSV row: %d", matched)
+    logger.info("Matched to a results-parquet row: %d", matched)
     logger.info("Exported: %d", len(exported))
     logger.info("Missed (no matching row): %d", len(missed))
     if skipped_image:

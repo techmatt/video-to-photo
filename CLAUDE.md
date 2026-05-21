@@ -21,39 +21,40 @@ Order, with the intermediate artifact each one consumes/produces (all under `<ou
 | Stage | Module | Reads | Writes |
 |---|---|---|---|
 | 0 | `inventory` | `dirs_file` from YAML | `manifest.csv` |
-| 1 | `pass1_index` | `manifest.csv` | `index.parquet`, `pass1_status.csv`, `pass1_summary.json`, `frames/<stem>/*.jpg` |
-| 1b | `cluster_faces` | `index.parquet` (embeddings) | identity clusters (stub today) |
-| 2 | `pass2_score` | `index.parquet` | `scores.csv`, `pass2_summary.json`, `top_frames/*.jpg` |
-| 3 | `pass3_refine` | `scores.csv` | `refined_scores.csv`, `pass3_summary.json` (+ refined frames) |
-| 4 | `build_index_html` | `refined_scores.csv` (falls back to `scores.csv`) | `index.html` (self-contained, base64-embedded face crops), `build_index_summary.json` |
-| 5 | `build_photo_viewer` | `refined_scores.csv` + `index.parquet` | `index_photos.html`, `build_photo_viewer_summary.json` |
+| 1 | `pipeline` | `manifest.csv` | `results.parquet`, `pipeline_status.csv`, `pipeline_summary.json`, `kept/*.jpg` |
+| 2 | `build_faces_review` | `results.parquet` | `faces_review.html` (self-contained, base64-embedded face crops), `build_faces_review_summary.json` |
+| 3 | `build_photo_viewer` | `results.parquet` | `index_photos.html`, `build_photo_viewer_summary.json` |
+
+`train_classifier.py` and `save_labeled_faces.py` also consume `results.parquet`; both accept `--config <yaml>` and derive the parquet path from `output_dir`.
 
 ## Configuration model
 
-Every stage accepts `--config <yaml>` (e.g. `configs/mini.yaml`) loaded via `RunConfig.from_yaml`. The YAML names a run, points at a `dirs_file` (one source directory per line, `#` for comments), sets long-video sampling parameters, and chooses the output directory. Per-stage path flags (`--index-file`, `--scores-csv`, `--output-dir`, `--output-html`, `--parquet`) are optional overrides that default from `output_dir` when `--config` is supplied; per-stage tuning knobs (`--top-k-per-file`, `--classifier-model`, `--window-s`, …) remain explicit flags only.
+Every stage accepts `--config <yaml>` (e.g. `configs/mini.yaml`) loaded via `RunConfig.from_yaml`. The YAML names a run, points at a `dirs_file` (one source directory per line, `#` for comments), sets long-video sampling parameters, and chooses the output directory. Per-stage path flags (`--results`, `--output-dir`, `--output-html`) are optional overrides that default from `output_dir` when `--config` is supplied; per-stage tuning knobs (`--fps`, `--max-per-file`, `--max-per-video`, `--quality-threshold`, …) remain explicit flags only.
 
 ## Architecture notes worth knowing before editing
 
-**Manifest is the contract for what to process.** `inventory.py` crawls source dirs, hashes the first 64 KiB of each file with MD5, marks duplicates (same hash) with a canonical-path pointer, probes video durations, and pre-computes `sample_windows_s` for long videos (>`long_video_threshold_s`). Pass 1 reads `manifest.csv`, filters `is_duplicate == True`, and processes the rest. Sort order matters: the manifest is sorted by `size_bytes` ascending so small files process first and give early signal.
+**Manifest is the contract for what to process.** `inventory.py` crawls source dirs, hashes the first 64 KiB of each file with MD5, marks duplicates (same hash) with a canonical-path pointer, probes video durations, and pre-computes `sample_windows_s` for long videos (>`long_video_threshold_s`). `pipeline.py` reads `manifest.csv`, filters `is_duplicate == True`, and processes the rest. Sort order matters: the manifest is sorted by `size_bytes` ascending so small files process first and give early signal.
 
-**Pass 1 sampling has two modes**, selected per row:
-- Short videos: `sample_frames()` walks the whole duration at `--fps` (default 3 fps).
+**Per-file worker is the unit of work.** `pipeline.py` iterates manifest rows and calls `worker.process_file` once per row. Each call handles one video or image end-to-end: decode → uprighter rotation → sharpness/face-detect gates → aesthetic + classifier scoring → per-file dHash dedup (face then full frame) → quality threshold → per-file cap → refine pass on ±`refine_window_s` for video → write keeper JPEGs. The orchestrator never writes intermediate per-frame artifacts; only final keepers land on disk under `kept/`.
+
+**Sampling has two modes**, selected per row:
+- Short videos: `sample_frames()` walks the whole duration at `--fps` (default 1 fps).
 - Long videos: `sample_frames_windowed()` decodes 1-second windows at the pre-computed `sample_windows_s` offsets only. Windows are seeded from the file hash so the same file gets the same windows across runs.
 
-**Resume is driven by `pass1_status.csv`.** Each processed file appends one row with per-gate counters (sharpness/face-detect/face-size), sharpness diagnostics, and `status` (`done`/`failed`). On startup pass 1 skips any `file_path` whose latest row is `done` unless `--rescan` is set. If an older-schema status CSV is present, `_ensure_status_csv_schema()` rewrites it with the current `STATUS_COLUMNS` before any append — necessary because `csv.DictWriter` would otherwise produce a column-count mismatch.
+**Resume is driven by `pipeline_status.csv`.** Each processed file appends one row (`file_path, status, keepers, elapsed_s, processed_at`). On startup the orchestrator skips any `file_path` whose latest row is `done` unless `--rescan` is set. Test-mode runs (`--max-videos` / `--max-images`) do not write status rows so a real run will redo those files; they also write to `results_test.parquet` instead of `results.parquet`.
 
-**Gate ordering in pass 1 is sharpness → face-detect → face-size**, and every gate has a dedicated counter on the `FileStats` dataclass. When debugging "why did this file produce zero rows", read the relevant `pass1_status.csv` row — `frames_failed_*` tells you which gate dropped them.
+**Cross-file dedup + per-video cap run at the end** over the union of (this run's fresh keepers) ∪ (keepers loaded from any prior `results.parquet`). `_cross_file_dedup` greedily drops frame-dHash neighbors within `--frame-dedup-threshold` (higher composite wins); `_apply_video_cap` keeps the top `--max-per-video` composite per source `video_path`. The final survivors are what gets written to `results.parquet`.
 
-**Pass 1 GPU parallelism.** Videos can run through a `ProcessPoolExecutor` (`--workers N`) where each worker initializes its own `FaceAnalysis` via `_worker_init`; images always run single-threaded in the main process. The module-level `_face_app` is the per-process singleton — don't try to share it across workers.
+**`results.parquet` is the single downstream artifact.** Notable columns: `video_path`, `video_stem`, `source_type` (`video`|`image`), `timestamp_s`, `refined_timestamp_s`, `frame_w`/`frame_h`, `face_x1/y1/x2/y2`, `face_w`, `face_det_score`, `kps` (JSON-encoded 5-point landmarks), `embedding` (JSON-encoded 512-d face embedding), `sharpness_center`, `refined_sharpness`, `aesthetics_norm`, `composite`, `p_none`/`p_bad`/`p_okay`/`p_good`, `pred_label`, `pred_confidence`, `uprighter_pred`, `uprighter_confidence`, `kept_path` (absolute path to the keeper JPEG under `kept/`).
 
-**The Parquet index is the join key for everything downstream.** Pass 1 dedups on `frame_path` when merging existing + new rows (`drop_duplicates(subset=["frame_path"], keep="last")`), so re-running a file safely overwrites its old rows.
+**Card key is the join contract between Python and browser localStorage.** `constants.card_key(video_stem, kept_path)` returns `{video_stem}/{Path(kept_path).name}`. This key is used by `build_faces_review.py`'s `data-filename`, by `train_classifier.py`'s label join, and by `save_labeled_faces.py`'s lookup. Keep all four in sync — if you rename the key format, every reader needs the same change.
 
 ## Coding conventions in use
 
 - Python 3.12+ syntax: `|` unions, built-in generics (`list[...]`, `dict[...]`), `pathlib.Path` everywhere.
 - Logging via module-level `logger = logging.getLogger(__name__)`, configured once in `main()` with `force=True`. INFO-level per-file lines use ASCII separators (not em dashes) because logging writes to stderr, which isn't reconfigured to UTF-8.
 - `argparse` directly; no click/typer.
-- Flat module layout under `still_extractor/`; shared helpers live in their own small modules (e.g. `face_crop.py`) rather than a `utils` grab-bag.
+- Flat module layout under `still_extractor/`; shared helpers live in their own small modules (e.g. `face_crop.py`, `constants.py`, `utils.py`) rather than a `utils` grab-bag.
 - One CLI entry point per stage. Each module's `main()` is the entry; tests/scripts can import the helpers directly.
 
 ## Docs to consult
