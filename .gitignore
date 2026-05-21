@@ -255,3 +255,4 @@ clusters/
 
 # Hand-edited identity labels (regenerated per run; treat as local config)
 clusters.yaml
+/.claude/scheduled_tasks.lock
