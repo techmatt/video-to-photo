@@ -6,8 +6,8 @@ from pathlib import Path
 from PIL import Image
 
 
-def extract_face_crop(
-    image_path: Path,
+def extract_face_crop_from_image(
+    img: Image.Image,
     x1: float,
     y1: float,
     x2: float,
@@ -15,13 +15,12 @@ def extract_face_crop(
     padding: int,
     kps: list | None = None,
 ) -> Image.Image:
-    """Crop a face region from an image on disk with padding clamped to image bounds.
+    """Crop a face region from an already-decoded PIL image with padding and roll correction.
 
     If `kps` is provided (InsightFace 5-point landmarks: left eye, right eye, nose,
     left mouth corner, right mouth corner), correct the roll angle so the eyes are
     horizontal in the returned crop. Sub-2 degree corrections are skipped as noise.
     """
-    img = Image.open(image_path).convert("RGB")
     w, h = img.size
 
     angle = 0.0
@@ -58,3 +57,17 @@ def extract_face_crop(
     if cx2 <= cx1 or cy2 <= cy1:
         return img
     return img.crop((cx1, cy1, cx2, cy2))
+
+
+def extract_face_crop(
+    image_path: Path,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    padding: int,
+    kps: list | None = None,
+) -> Image.Image:
+    """Crop a face region from an image on disk. Thin wrapper around the in-memory variant."""
+    img = Image.open(image_path).convert("RGB")
+    return extract_face_crop_from_image(img, x1, y1, x2, y2, padding, kps)

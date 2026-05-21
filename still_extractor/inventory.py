@@ -4,7 +4,6 @@ import csv
 import hashlib
 import json
 import logging
-import random
 import statistics
 import sys
 from argparse import ArgumentParser
@@ -14,11 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import av
+import pandas as pd
 import pillow_heif
 import yaml
 from tqdm import tqdm
 
 from still_extractor.constants import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+from still_extractor.sampling import compute_sample_windows
 
 pillow_heif.register_heif_opener()
 
@@ -110,28 +111,6 @@ def probe_video_duration(path: Path) -> float | None:
         return None
 
 
-def compute_sample_windows(
-    duration_s: float,
-    n_windows: int,
-    min_spacing_s: float,
-    seed: int,
-) -> list[int]:
-    last_candidate = int(duration_s) - 1
-    if last_candidate <= 0:
-        return []
-    candidates = list(range(0, last_candidate))
-    rng = random.Random(seed)
-    rng.shuffle(candidates)
-    accepted: list[int] = []
-    for c in candidates:
-        if all(abs(c - a) >= min_spacing_s for a in accepted):
-            accepted.append(c)
-            if len(accepted) >= n_windows:
-                break
-    accepted.sort()
-    return accepted
-
-
 def load_existing_manifest(manifest_path: Path) -> tuple[list[dict], set[str]]:
     if not manifest_path.exists():
         return [], set()
@@ -179,25 +158,12 @@ def _serialize_row(row: dict) -> dict:
     return out
 
 
-def main() -> None:
-    parser = ArgumentParser(description="Build a manifest of all video and image files for a run.")
-    parser.add_argument("--config", type=Path, required=True, help="Path to run YAML config file.")
-    parser.add_argument("--rescan", action="store_true",
-                        help="Re-crawl all directories and rebuild the manifest from scratch.")
-    args = parser.parse_args()
+def run_inventory(cfg: RunConfig, rescan: bool) -> pd.DataFrame:
+    """Crawl source directories, build the manifest, and return it as a DataFrame.
 
-    logging.basicConfig(
-        level="INFO",
-        format="%(asctime)s %(levelname)s %(message)s",
-        force=True,
-    )
-
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except (AttributeError, OSError):
-        pass
-
-    cfg = RunConfig.from_yaml(args.config)
+    This is the importable entry point used by the pipeline orchestrator. The CLI
+    `main()` is a thin wrapper that parses args, sets up logging, and calls this.
+    """
     manifest_path = cfg.output_dir / "manifest.csv"
 
     print("═══════════════════════════════════════")
@@ -209,7 +175,7 @@ def main() -> None:
 
     existing_rows: list[dict] = []
     existing_paths: set[str] = set()
-    if not args.rescan:
+    if not rescan:
         existing_rows, existing_paths = load_existing_manifest(manifest_path)
 
     dirs = load_dirs(cfg.dirs_file)
@@ -248,7 +214,7 @@ def main() -> None:
         rows_out = [_serialize_row(r) for r in existing_rows]
         rows_out.sort(key=lambda r: int(r["size_bytes"]))
         write_manifest(manifest_path, rows_out)
-        return
+        return pd.read_csv(manifest_path) if manifest_path.exists() else pd.DataFrame()
 
     new_paths.sort(key=lambda p: str(p))
 
@@ -340,7 +306,7 @@ def main() -> None:
             duration_s=d,
             n_windows=cfg.long_video_windows,
             min_spacing_s=cfg.long_video_min_spacing_s,
-            seed=seed,
+            seed_hash=seed,
         )
         windows_by_path[p] = windows
         long_video_report.append((p, d, len(windows)))
@@ -414,6 +380,30 @@ def main() -> None:
             f"{_format_bytes(max(sizes_all))} (median {_format_bytes(median_size)})"
         )
     print("───────────────────────────────────────")
+
+    return pd.read_csv(manifest_path)
+
+
+def main() -> None:
+    parser = ArgumentParser(description="Build a manifest of all video and image files for a run.")
+    parser.add_argument("--config", type=Path, required=True, help="Path to run YAML config file.")
+    parser.add_argument("--rescan", action="store_true",
+                        help="Re-crawl all directories and rebuild the manifest from scratch.")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level="INFO",
+        format="%(asctime)s %(levelname)s %(message)s",
+        force=True,
+    )
+
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+
+    cfg = RunConfig.from_yaml(args.config)
+    run_inventory(cfg, rescan=args.rescan)
 
 
 if __name__ == "__main__":
