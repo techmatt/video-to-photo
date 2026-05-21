@@ -13,7 +13,7 @@ InsightFace `buffalo_l` weights are non-commercial research only. Personal/famil
 Each stage is a module under `still_extractor/`, run via:
 
 ```
-uv run python -m still_extractor.<module> --help
+uv run python -m still_extractor.<module> --config configs/<run>.yaml
 ```
 
 Order, with the intermediate artifact each one consumes/produces (all under `<output_dir>/` from the YAML config):
@@ -21,17 +21,16 @@ Order, with the intermediate artifact each one consumes/produces (all under `<ou
 | Stage | Module | Reads | Writes |
 |---|---|---|---|
 | 0 | `inventory` | `dirs_file` from YAML | `manifest.csv` |
-| 1 | `pass1_index` | `manifest.csv` | `index.parquet`, `pass1_status.csv`, `frames/<stem>/*.jpg` |
+| 1 | `pass1_index` | `manifest.csv` | `index.parquet`, `pass1_status.csv`, `pass1_summary.json`, `frames/<stem>/*.jpg` |
 | 1b | `cluster_faces` | `index.parquet` (embeddings) | identity clusters (stub today) |
-| 2 | `pass2_score` | `index.parquet` | `scores.csv`, `jpegs/*.jpg` |
-| 3 | `pass3_refine` | `scores.csv` | `refined_scores.csv` (+ refined frames) |
-| 4 | `build_index_html` | `refined_scores.csv` (falls back to `scores.csv`) | `index.html` (self-contained, base64-embedded face crops) |
-
-Pass 2/3/`build_index_html` currently take individual `--index-file` / `--scores-csv` / `--output-dir` flags rather than the YAML config — different convention than inventory/pass1.
+| 2 | `pass2_score` | `index.parquet` | `scores.csv`, `pass2_summary.json`, `top_frames/*.jpg` |
+| 3 | `pass3_refine` | `scores.csv` | `refined_scores.csv`, `pass3_summary.json` (+ refined frames) |
+| 4 | `build_index_html` | `refined_scores.csv` (falls back to `scores.csv`) | `index.html` (self-contained, base64-embedded face crops), `build_index_summary.json` |
+| 5 | `build_photo_viewer` | `refined_scores.csv` + `index.parquet` | `index_photos.html`, `build_photo_viewer_summary.json` |
 
 ## Configuration model
 
-`inventory` and `pass1_index` are driven by a single YAML (e.g. `configs/mini.yaml`) loaded via `RunConfig.from_yaml`. The YAML names a run, points at a `dirs_file` (one source directory per line, `#` for comments), sets long-video sampling parameters, and chooses the output directory. Every other stage today still takes individual paths on the command line — keep that asymmetry in mind when wiring new stages.
+Every stage accepts `--config <yaml>` (e.g. `configs/mini.yaml`) loaded via `RunConfig.from_yaml`. The YAML names a run, points at a `dirs_file` (one source directory per line, `#` for comments), sets long-video sampling parameters, and chooses the output directory. Per-stage path flags (`--index-file`, `--scores-csv`, `--output-dir`, `--output-html`, `--parquet`) are optional overrides that default from `output_dir` when `--config` is supplied; per-stage tuning knobs (`--top-k-per-file`, `--classifier-model`, `--window-s`, …) remain explicit flags only.
 
 ## Architecture notes worth knowing before editing
 

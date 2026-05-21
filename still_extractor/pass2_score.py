@@ -421,6 +421,9 @@ def main() -> None:
                         help="Root output dir; JPEGs go to {output-dir}/top_frames/.")
     parser.add_argument("--top-k-per-file", type=int, default=5,
                         help="Max frames to select per source file.")
+    parser.add_argument("--top-k-per-video", type=int, default=10,
+                        help="Max final-selection frames per source video (grouped by "
+                             "video_path); applied after per-file top-K. 0 = no cap.")
     parser.add_argument("--top-k-global", type=int, default=0,
                         help="Optional global cap after per-file selection; 0 = no cap.")
     parser.add_argument("--aesthetics-weight", type=float, default=1.0,
@@ -602,6 +605,35 @@ def main() -> None:
             int(df["final_selection"].sum()),
         )
 
+    videos_capped = 0
+    if args.top_k_per_video > 0:
+        final_rows = df.loc[df["final_selection"]].copy()
+        group_sizes = final_rows.groupby("video_path", sort=False).size()
+        over_cap = group_sizes[group_sizes > args.top_k_per_video]
+        videos_capped = int(len(over_cap))
+        if videos_capped > 0:
+            ranks = (
+                final_rows.groupby("video_path", sort=False)["composite"]
+                .rank(method="first", ascending=False)
+            )
+            drop_idx = final_rows.index[ranks > args.top_k_per_video]
+            df.loc[drop_idx, "final_selection"] = False
+            n_dropped = int(len(drop_idx))
+            max_excess = int(over_cap.max() - args.top_k_per_video)
+            logger.info(
+                "[SELECTION] Per-video cap (top-%d): %d videos capped, %d frames dropped "
+                "(max excess on one video: %d); final selection now %d rows",
+                args.top_k_per_video, videos_capped, n_dropped, max_excess,
+                int(df["final_selection"].sum()),
+            )
+        else:
+            logger.info(
+                "[SELECTION] Per-video cap (top-%d): no videos exceeded cap",
+                args.top_k_per_video,
+            )
+    else:
+        logger.info("[SELECTION] Per-video cap: disabled")
+
     top_frames_dir = args.output_dir / "top_frames"
     final = (
         df[df["final_selection"]]
@@ -630,6 +662,8 @@ def main() -> None:
         "final_selection_count": final_count,
         "files_with_selection": files_with_selection,
         "files_with_zero_selection": files_with_zero_selection,
+        "top_k_per_video": args.top_k_per_video,
+        "videos_capped": videos_capped,
         "classifier_active": classifier_active,
         "classifier_model": (
             str(args.classifier_model) if classifier_active else None
