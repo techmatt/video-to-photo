@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from still_extractor.inventory import RunConfig
-from still_extractor.save_labeled_faces import run_export
+from still_extractor.save_labeled_faces import _atomic_write_json, run_export
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,28 @@ def _make_handler(
                 self._write_json(404, {"ok": False, "error": f"unknown path {self.path}"})
                 return
             try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                body = self.rfile.read(length) if length > 0 else b""
+
+                if body:
+                    try:
+                        posted_labels = json.loads(body.decode("utf-8"))
+                    except Exception as e:
+                        self._write_json(400, {
+                            "ok": False,
+                            "error": f"invalid JSON body: {e}",
+                        })
+                        return
+                    if not isinstance(posted_labels, dict):
+                        self._write_json(400, {
+                            "ok": False,
+                            "error": "body must be a JSON object mapping card_key -> label",
+                        })
+                        return
+                    logger.info("Received %d labels from client; updating %s",
+                                len(posted_labels), labels_json_path)
+                    _atomic_write_json(labels_json_path, posted_labels)
+
                 result = run_export(
                     labels_json_path=labels_json_path,
                     results_path=results_path,

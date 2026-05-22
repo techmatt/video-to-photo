@@ -168,6 +168,16 @@ def run_export(
     exported: list[dict] = _load_existing_labels(out_labels_json)
     logger.info("Loaded %d existing entries from %s", len(exported), out_labels_json)
 
+    already_exported_keys: set[tuple[str, str, float]] = set()
+    for e in exported:
+        if not isinstance(e, dict):
+            continue
+        c = e.get("corpus")
+        vp = e.get("video_path")
+        ts = e.get("timestamp_s")
+        if isinstance(c, str) and isinstance(vp, str) and isinstance(ts, (int, float)):
+            already_exported_keys.add((c, vp, float(ts)))
+
     new_count = 0
     dedup_skipped = 0
     missed: list[str] = []
@@ -191,6 +201,11 @@ def run_export(
         if video_path is None or timestamp_s is None:
             logger.warning("Skipping %s: missing video_path or timestamp_s", key)
             missed.append(key)
+            continue
+
+        if (corpus_name, video_path, timestamp_s) in already_exported_keys:
+            logger.debug("Skipping %s: already in manifest for corpus", key)
+            dedup_skipped += 1
             continue
 
         kept = _safe_str(row.get("kept_path"))

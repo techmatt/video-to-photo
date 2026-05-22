@@ -68,6 +68,9 @@ header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; }
 .toolbar button.active { background: #3a5fb0; border-color: #4a7fd0; }
 .toolbar .summary { margin-left: auto; color: #aaa; font-size: 12px; }
 .toolbar .toolbar-label { color: #888; font-size: 12px; margin-right: 4px; }
+.toolbar .export-status { color: #aaa; font-size: 12px; min-width: 4ch; }
+.toolbar .export-status.error { color: #d97a7a; }
+.toolbar .export-status.success { color: #7ad97a; }
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -321,21 +324,47 @@ function downloadLabelsJson() {
   URL.revokeObjectURL(url);
 }
 
+function setExportStatus(text, kind) {
+  const el = document.getElementById('export-status');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.remove('error', 'success');
+  if (kind) el.classList.add(kind);
+}
+
 async function exportLabels() {
   const SERVER = "http://localhost:7432/export";
-  const TIMEOUT_MS = 10000;
+  const TIMEOUT_MS = 60000;
+
+  const startTime = performance.now();
+  setExportStatus("Connecting to server…");
+
+  let tickId = null;
+  const startTick = () => {
+    tickId = setInterval(() => {
+      const elapsed = (performance.now() - startTime) / 1000;
+      setExportStatus(`Waiting for server completion (${elapsed.toFixed(1)}s)`);
+    }, 100);
+  };
+  const stopTick = () => { if (tickId !== null) { clearInterval(tickId); tickId = null; } };
 
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    const labelsBody = JSON.stringify(collectLabels());
+    startTick();
     const resp = await fetch(SERVER, {
       method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: labelsBody,
       signal: controller.signal,
     });
     clearTimeout(timer);
+    stopTick();
 
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({ error: resp.statusText }));
+      setExportStatus(`Export failed: ${err.error || resp.statusText}`, 'error');
       alert(
         `Export failed (server error):\n${err.error || resp.statusText}\n\n` +
         `Make sure the server is running:\n` +
@@ -345,6 +374,11 @@ async function exportLabels() {
     }
 
     const result = await resp.json();
+    const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+    setExportStatus(
+      `Export done in ${elapsed}s — ${result.new} added, ${result.skipped_already_exported} already in store (total ${result.total_in_store})`,
+      'success',
+    );
     alert(
       `Export complete!\n\n` +
       `New faces added:       ${result.new}\n` +
@@ -356,10 +390,15 @@ async function exportLabels() {
     );
 
   } catch (e) {
+    stopTick();
     const isAbort = e.name === "AbortError";
     const msg = isAbort
-      ? "Export server did not respond within 10 seconds."
+      ? `Export server did not respond within ${(TIMEOUT_MS / 1000) | 0} seconds.`
       : "Could not reach the export server.";
+    setExportStatus(
+      isAbort ? "Server timed out — downloaded locally" : "Server unreachable — downloaded locally",
+      'error',
+    );
     alert(
       `${msg}\n\n` +
       `Start it with:\n` +
@@ -643,6 +682,7 @@ def main() -> None:
     <button class="filter-btn" data-filter="good">Good</button>
     <button class="filter-btn" data-filter="unreviewed">Unreviewed</button>
     <button id="export-btn">Export Labels</button>
+    <span class="export-status" id="export-status"></span>
     <span class="summary" id="summary"></span>
   </div>
 {sort_row}{pred_row}  <div class="legend">
