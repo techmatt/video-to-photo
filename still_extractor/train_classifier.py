@@ -1,9 +1,13 @@
-"""Train a 4-class face quality classifier (None/Bad/Okay/Good) on labeled face crops.
+"""Train a 4-class face quality classifier (None/Bad/Okay/Good).
 
-Backbone: MobileNetV3-Small (ImageNet pretrained), trained in two phases —
-first the classifier head only, then the last InvertedResidual block plus
-the head. After training, runs inference on the full corpus (results.parquet)
-with and without 5-pass test-time augmentation, and writes soft labels to CSV.
+Training data comes from the global face labels store at
+``data/face_labels/labels.json`` (a JSON list whose entries point at
+already-extracted face crops via ``face_crop_path``). Backbone:
+MobileNetV3-Small (ImageNet pretrained), fine-tuned in two phases — first the
+classifier head, then the last InvertedResidual block plus the head. After
+training, optionally runs inference on every row in ``results.parquet``
+(when ``--results`` or ``--config`` is provided), with and without 5-pass
+test-time augmentation, and writes soft labels to CSV.
 """
 
 import argparse
@@ -22,6 +26,7 @@ import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as T
 from PIL import Image
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 from sklearn.model_selection import StratifiedShuffleSplit
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
@@ -34,7 +39,6 @@ from still_extractor.constants import (
     IMAGENET_MEAN,
     IMAGENET_STD,
     LABEL_TO_IDX,
-    card_key,
 )
 from still_extractor.face_crop import extract_face_crop_from_image
 from still_extractor.inventory import RunConfig
@@ -47,9 +51,13 @@ IDX_TO_LABEL = {v: k for k, v in LABEL_TO_IDX.items()}
 N_CLASSES = len(FACE_QUALITY_LABELS)
 DISPLAY_SIZE = FACE_QUALITY_INPUT_SIZE
 
+DEFAULT_LABELS_STORE: Path = Path("data/face_labels/labels.json")
+TRAIN_LABEL_SMOOTHING: float = 0.1
+MIXUP_ALPHA: float = 0.3
+
 
 class JpegRecompress:
-    """Re-encode the image as JPEG at a random quality, then decode. Matches Prompt 27."""
+    """Re-encode the image as JPEG at a random quality, then decode."""
 
     def __init__(self, q_min: int = 60, q_max: int = 95) -> None:
         self.q_min = q_min
@@ -69,6 +77,12 @@ def _build_train_transform() -> T.Compose:
     return T.Compose([
         T.RandomHorizontalFlip(p=0.5),
         T.RandomRotation(degrees=15, interpolation=T.InterpolationMode.BICUBIC, fill=0),
+        # Down-up resize: attack the resolution-quality shortcut so large
+        # "Good" source faces still see low-res inputs at training time.
+        T.RandomApply([
+            T.Resize(64, interpolation=T.InterpolationMode.BILINEAR),
+            T.Resize(128, interpolation=T.InterpolationMode.BILINEAR),
+        ], p=0.3),
         T.RandomResizedCrop(
             size=DISPLAY_SIZE,
             scale=(0.80, 1.00),
@@ -94,65 +108,92 @@ def _build_val_transform() -> T.Compose:
     ])
 
 
-def _row_key(row: pd.Series) -> str | None:
-    stem = row.get("video_stem")
-    if not isinstance(stem, str) or not stem:
-        return None
-    kept = row.get("kept_path")
-    if isinstance(kept, str) and kept:
-        return card_key(stem, kept)
-    return None
-
-
-def _crop_for_row(row: pd.Series) -> Image.Image | None:
-    kept = row.get("kept_path")
-    if not isinstance(kept, str) or not kept:
-        return None
-    img_path = Path(kept)
-    if not img_path.exists():
-        return None
-    try:
-        img = Image.open(img_path).convert("RGB")
-        crop = extract_face_crop_from_image(
-            img,
-            row["face_x1"], row["face_y1"], row["face_x2"], row["face_y2"],
-            FACE_CROP_PADDING,
-            kps=parse_kps(row.get("kps")),
-        )
-    except Exception as e:
-        logger.warning("Failed to crop %s: %s", img_path, e)
-        return None
-    return crop.resize((DISPLAY_SIZE, DISPLAY_SIZE), Image.BICUBIC)
-
-
 class FaceCropDataset(Dataset):
-    def __init__(
-        self,
-        crops: list[Image.Image],
-        labels: list[int] | None,
-        transform,
-    ) -> None:
+    """Dataset of labeled face crops loaded from disk on demand."""
+
+    def __init__(self, items: list[tuple[Path, int]], transform) -> None:
+        self.items = items
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        path, label = self.items[idx]
+        img = Image.open(path).convert("RGB")
+        return self.transform(img), label
+
+
+class InMemoryCropDataset(Dataset):
+    """In-memory PIL crops used by the inference pass."""
+
+    def __init__(self, crops: list[Image.Image], transform) -> None:
         self.crops = crops
-        self.labels = labels
         self.transform = transform
 
     def __len__(self) -> int:
         return len(self.crops)
 
     def __getitem__(self, idx: int):
-        img = self.transform(self.crops[idx])
-        if self.labels is None:
-            return img
-        return img, self.labels[idx]
+        return self.transform(self.crops[idx])
+
+
+def _resolve_crop_path(raw_path: str, labels_store: Path) -> Path:
+    """Resolve a crop path from the labels store.
+
+    Tries the path as-is (absolute, or relative to cwd) first; if that does
+    not exist, falls back to resolving relative to the labels-store's parent's
+    parent (so ``data/face_labels/labels.json`` + ``data/face_labels/foo.jpg``
+    works regardless of cwd).
+    """
+    p = Path(raw_path)
+    if p.is_absolute():
+        return p
+    if p.exists():
+        return p
+    return labels_store.parent.parent / p
+
+
+def _load_labels_store(labels_store: Path) -> list[tuple[Path, int]]:
+    raw = json.loads(labels_store.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise SystemExit(
+            f"Expected JSON list at top level of {labels_store}, "
+            f"got {type(raw).__name__}",
+        )
+    items: list[tuple[Path, int]] = []
+    missing_file = 0
+    invalid_label = 0
+    for entry in raw:
+        label_str = str(entry.get("label", "")).lower()
+        if label_str not in LABEL_TO_IDX:
+            invalid_label += 1
+            continue
+        crop_path = _resolve_crop_path(entry.get("face_crop_path", ""), labels_store)
+        if not crop_path.exists():
+            missing_file += 1
+            continue
+        items.append((crop_path, LABEL_TO_IDX[label_str]))
+    if missing_file:
+        logger.warning(
+            "%d/%d labels skipped: face_crop_path does not exist on disk",
+            missing_file, len(raw),
+        )
+    if invalid_label:
+        logger.warning(
+            "%d/%d labels skipped: label not in %s",
+            invalid_label, len(raw), list(LABEL_TO_IDX.keys()),
+        )
+    return items
 
 
 def mixup_batch(
-    x: torch.Tensor, y_onehot: torch.Tensor, alpha: float = 0.2,
+    x: torch.Tensor, y_targets: torch.Tensor, alpha: float = MIXUP_ALPHA,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     lam = float(np.random.beta(alpha, alpha))
     idx = torch.randperm(x.size(0), device=x.device)
     x_mix = lam * x + (1 - lam) * x[idx]
-    y_mix = lam * y_onehot + (1 - lam) * y_onehot[idx]
+    y_mix = lam * y_targets + (1 - lam) * y_targets[idx]
     return x_mix, y_mix
 
 
@@ -166,7 +207,7 @@ def _build_model() -> nn.Module:
 
 
 def _apply_phase(model: nn.Module, phase: int) -> None:
-    """Freeze/unfreeze parameters according to the training phase, and log trainables."""
+    """Freeze/unfreeze parameters according to the training phase."""
     if phase == 1:
         for name, param in model.named_parameters():
             param.requires_grad = "classifier" in name
@@ -199,10 +240,6 @@ def _make_optimizer(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=total_epochs, eta_min=1e-5,
     )
-    # Fast-forward the scheduler to match the current epoch when resuming after
-    # a phase transition. CosineAnnealingLR computes LR purely from its internal
-    # step counter, so manually stepping it is the simplest way to align without
-    # needing to seed initial_lr on the freshly-created optimizer.
     if start_epoch > 0:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -218,11 +255,13 @@ def train_one_epoch(
     model.train()
     total_loss = 0.0
     n_seen = 0
+    smoothing = TRAIN_LABEL_SMOOTHING
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         y_onehot = F.one_hot(y, num_classes=N_CLASSES).float()
-        x_mix, y_mix = mixup_batch(x, y_onehot, alpha=0.2)
+        y_smooth = (1.0 - smoothing) * y_onehot + smoothing / N_CLASSES
+        x_mix, y_mix = mixup_batch(x, y_smooth, alpha=MIXUP_ALPHA)
         logits = model(x_mix)
         loss = -(y_mix * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
         optimizer.zero_grad()
@@ -266,11 +305,71 @@ def evaluate(
     return val_loss, val_acc, per_class_acc
 
 
+@torch.no_grad()
+def _collect_predictions(
+    model: nn.Module, loader: DataLoader, device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    all_true: list[int] = []
+    all_pred: list[int] = []
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        logits = model(x)
+        all_pred.extend(logits.argmax(dim=1).cpu().numpy().tolist())
+        all_true.extend(y.cpu().numpy().tolist())
+    return np.array(all_true), np.array(all_pred)
+
+
+def _print_validation_report(y_true: np.ndarray, y_pred: np.ndarray) -> None:
+    labels = list(range(N_CLASSES))
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    prec, rec, f1, support = precision_recall_fscore_support(
+        y_true, y_pred, labels=labels, zero_division=0,
+    )
+    print("\nValidation confusion matrix (rows=true, cols=pred):")
+    col_header = "            " + " ".join(f"{IDX_TO_LABEL[c]:>6}" for c in labels)
+    print(col_header)
+    for r in labels:
+        row_str = " ".join(f"{cm[r, c]:>6d}" for c in labels)
+        print(f"{IDX_TO_LABEL[r]:>12} {row_str}")
+    print("\nPer-class metrics (validation):")
+    print(f"{'class':>10} {'prec':>8} {'recall':>8} {'f1':>8} {'support':>8}")
+    for c in labels:
+        print(
+            f"{IDX_TO_LABEL[c]:>10} {prec[c]:>8.3f} {rec[c]:>8.3f} "
+            f"{f1[c]:>8.3f} {int(support[c]):>8d}"
+        )
+    n = int(support.sum())
+    overall_acc = float((np.array(y_true) == np.array(y_pred)).sum()) / max(n, 1)
+    print(f"\nOverall validation accuracy: {overall_acc:.3f} ({n} samples)")
+
+
+def _crop_for_row(row: pd.Series) -> Image.Image | None:
+    kept = row.get("kept_path")
+    if not isinstance(kept, str) or not kept:
+        return None
+    img_path = Path(kept)
+    if not img_path.exists():
+        return None
+    try:
+        img = Image.open(img_path).convert("RGB")
+        crop = extract_face_crop_from_image(
+            img,
+            row["face_x1"], row["face_y1"], row["face_x2"], row["face_y2"],
+            FACE_CROP_PADDING,
+            kps=parse_kps(row.get("kps")),
+        )
+    except Exception as e:
+        logger.warning("Failed to crop %s: %s", img_path, e)
+        return None
+    return crop.resize((DISPLAY_SIZE, DISPLAY_SIZE), Image.BICUBIC)
+
+
 def _run_inference_pass(
     model: nn.Module, crops: list[Image.Image], transform,
     device: torch.device, batch_size: int,
 ) -> np.ndarray:
-    ds = FaceCropDataset(crops, labels=None, transform=transform)
+    ds = InMemoryCropDataset(crops, transform=transform)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
     all_probs: list[np.ndarray] = []
     model.eval()
@@ -292,18 +391,23 @@ def _format_counts(labels: list[int]) -> dict[str, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train face quality classifier and run inference on the full corpus.",
+        description="Train face quality classifier from the global labels store, "
+                    "then optionally score every row in a results.parquet.",
     )
     parser.add_argument("--config", type=Path, default=None,
                         help="Run YAML config. When provided, --results defaults "
-                             "to {output_dir}/results.parquet. Explicit flag still overrides.")
+                             "to {output_dir}/results.parquet.")
+    parser.add_argument("--labels-store", type=Path, default=DEFAULT_LABELS_STORE,
+                        help="Path to the global face labels store (list JSON).")
     parser.add_argument("--results", type=Path, default=None,
-                        help="Path to results.parquet from the pipeline.")
-    parser.add_argument("--labels-json", type=Path,
-                        default=Path("save/labels.json"))
+                        help="Optional results.parquet to score after training. "
+                             "Not used for training data loading.")
+    parser.add_argument("--labels-json", type=Path, default=None,
+                        help="(deprecated) Legacy per-run labels.json — ignored "
+                             "when --labels-store is the active path.")
     parser.add_argument("--output-dir", type=Path,
                         default=DEFAULT_FACE_QUALITY_MODEL.parent)
-    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
@@ -319,12 +423,16 @@ def main() -> None:
         force=True,
     )
 
+    if args.labels_json is not None:
+        logger.warning(
+            "--labels-json is deprecated and ignored; training data is now read "
+            "from --labels-store (%s).", args.labels_store,
+        )
+
     if args.config is not None:
         cfg = RunConfig.from_yaml(args.config)
         if args.results is None:
             args.results = cfg.output_dir / "results.parquet"
-    if args.results is None:
-        parser.error("--results is required when --config is not provided")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -336,56 +444,29 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
 
-    labels_raw = json.loads(args.labels_json.read_text(encoding="utf-8"))
-    df = pd.read_parquet(args.results).reset_index(drop=True)
-    logger.info(
-        "Loaded %d keeper rows from %s, %d labels from %s",
-        len(df), args.results, len(labels_raw), args.labels_json,
-    )
-
-    keys: list[str | None] = [_row_key(df.iloc[i]) for i in range(len(df))]
-    label_strs: list[str | None] = [
-        labels_raw.get(k) if isinstance(k, str) else None for k in keys
-    ]
-
-    logger.info("Extracting %d face crops...", len(df))
-    crops: list[Image.Image | None] = []
-    for i in tqdm(range(len(df)), desc="crops", unit="img"):
-        crops.append(_crop_for_row(df.iloc[i]))
-    missing = sum(1 for c in crops if c is None)
-    if missing:
-        logger.warning("%d/%d rows had unreadable crops", missing, len(crops))
-
-    labeled_positions = [
-        i for i in range(len(df))
-        if label_strs[i] in LABEL_TO_IDX and crops[i] is not None
-    ]
-    labeled_crops = [crops[i] for i in labeled_positions]
-    labeled_labels = [LABEL_TO_IDX[label_strs[i]] for i in labeled_positions]
-    logger.info(
-        "Labeled rows usable for training: %d (of %d total labels)",
-        len(labeled_positions), len(labels_raw),
-    )
-    logger.info("Full labeled class counts: %s", _format_counts(labeled_labels))
-    if len(labeled_positions) < N_CLASSES * 2:
+    items = _load_labels_store(args.labels_store)
+    if len(items) < N_CLASSES * 2:
         raise SystemExit("Not enough labeled rows for stratified train/val split.")
+    item_labels = [lbl for _, lbl in items]
+    logger.info(
+        "Loaded %d labeled crops from %s; class counts: %s",
+        len(items), args.labels_store, _format_counts(item_labels),
+    )
 
     splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=args.seed)
-    train_pos, val_pos = next(
-        splitter.split(np.zeros(len(labeled_labels)), labeled_labels),
-    )
-    train_crops = [labeled_crops[i] for i in train_pos]
-    train_labels = [labeled_labels[i] for i in train_pos]
-    val_crops = [labeled_crops[i] for i in val_pos]
-    val_labels = [labeled_labels[i] for i in val_pos]
+    train_pos, val_pos = next(splitter.split(np.zeros(len(items)), item_labels))
+    train_items = [items[i] for i in train_pos]
+    val_items = [items[i] for i in val_pos]
+    train_labels = [lbl for _, lbl in train_items]
+    val_labels = [lbl for _, lbl in val_items]
     logger.info("Train class counts: %s", _format_counts(train_labels))
     logger.info("Val   class counts: %s", _format_counts(val_labels))
 
     train_transform = _build_train_transform()
     val_transform = _build_val_transform()
 
-    train_ds = FaceCropDataset(train_crops, train_labels, train_transform)
-    val_ds = FaceCropDataset(val_crops, val_labels, val_transform)
+    train_ds = FaceCropDataset(train_items, train_transform)
+    val_ds = FaceCropDataset(val_items, val_transform)
 
     train_counts = [0] * N_CLASSES
     for y in train_labels:
@@ -452,9 +533,7 @@ def main() -> None:
         })
         return tr_loss, val_loss
 
-    logger.info(
-        "=== Phase 1: training head only (epochs 1-%d) ===", phase1_end,
-    )
+    logger.info("=== Phase 1: training head only (epochs 1-%d) ===", phase1_end)
     for epoch in range(1, phase1_end + 1):
         _run_epoch(epoch, phase=1)
 
@@ -500,6 +579,30 @@ def main() -> None:
     model.load_state_dict(state["model_state"])
     logger.info("Reloaded best model from epoch %d", state["epoch"])
 
+    y_true, y_pred = _collect_predictions(model, val_loader, device)
+    _print_validation_report(y_true, y_pred)
+    print(
+        f"\nBest checkpoint: epoch {state['epoch']}, "
+        f"val_loss={float(state['val_loss']):.4f}",
+    )
+
+    if args.results is None:
+        logger.info("--results not provided; skipping inference pass on corpus.")
+        return
+
+    df = pd.read_parquet(args.results).reset_index(drop=True)
+    logger.info(
+        "Loaded %d keeper rows from %s for inference", len(df), args.results,
+    )
+
+    logger.info("Extracting %d face crops for inference...", len(df))
+    crops: list[Image.Image | None] = []
+    for i in tqdm(range(len(df)), desc="crops", unit="img"):
+        crops.append(_crop_for_row(df.iloc[i]))
+    missing = sum(1 for c in crops if c is None)
+    if missing:
+        logger.warning("%d/%d rows had unreadable crops", missing, len(crops))
+
     valid_idx = [i for i, c in enumerate(crops) if c is not None]
     valid_crops = [crops[i] for i in valid_idx]
     logger.info(
@@ -543,13 +646,11 @@ def main() -> None:
         pred_conf.append(float(row_tta[c]))
     out["pred_label"] = pred_labels
     out["pred_confidence"] = pred_conf
-    out["gt_label"] = [s if isinstance(s, str) else "" for s in label_strs]
 
     inference_path = args.output_dir / "inference_scores.csv"
     out.to_csv(inference_path, index=False)
     logger.info("Wrote %s (%d rows)", inference_path, len(out))
 
-    # Also write alongside results.parquet for convenience.
     results_inference_path = args.results.parent / "classifier" / "inference_scores.csv"
     results_inference_path.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(results_inference_path, index=False)
@@ -557,30 +658,10 @@ def main() -> None:
 
     nonempty_preds = [p for p in pred_labels if p]
     pred_counts = pd.Series(nonempty_preds).value_counts().to_dict()
-    finite_conf = [c for c in pred_conf if c == c]  # filter NaN
+    finite_conf = [c for c in pred_conf if c == c]
     mean_conf = float(np.mean(finite_conf)) if finite_conf else float("nan")
     logger.info("Prediction counts: %s", pred_counts)
     logger.info("Mean prediction confidence (TTA): %.3f", mean_conf)
-
-    labeled_pairs = [
-        (gt, pr) for gt, pr in zip(out["gt_label"], pred_labels)
-        if gt in LABEL_TO_IDX and pr in LABEL_TO_IDX
-    ]
-    if labeled_pairs:
-        cm = np.zeros((N_CLASSES, N_CLASSES), dtype=int)
-        for gt, pr in labeled_pairs:
-            cm[LABEL_TO_IDX[gt], LABEL_TO_IDX[pr]] += 1
-        print("Confusion matrix on labeled rows (rows=gt, cols=pred):")
-        col_header = "          " + " ".join(
-            f"{IDX_TO_LABEL[c]:>6}" for c in range(N_CLASSES)
-        )
-        print(col_header)
-        for r in range(N_CLASSES):
-            row_str = " ".join(f"{cm[r, c]:>6d}" for c in range(N_CLASSES))
-            print(f"{IDX_TO_LABEL[r]:>10} {row_str}")
-        correct = int(np.trace(cm))
-        total = int(cm.sum())
-        print(f"Labeled accuracy: {correct}/{total} = {correct / max(total, 1):.3f}")
 
 
 if __name__ == "__main__":
