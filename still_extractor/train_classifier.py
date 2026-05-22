@@ -54,6 +54,10 @@ DISPLAY_SIZE = FACE_QUALITY_INPUT_SIZE
 DEFAULT_LABELS_STORE: Path = Path("data/face_labels/labels.json")
 TRAIN_LABEL_SMOOTHING: float = 0.1
 MIXUP_ALPHA: float = 0.3
+MIXUP_ALPHA_GOOD_PAIR: float = 0.5
+SAMPLER_BOOST: dict[str, float] = {
+    "none": 1.0, "bad": 1.0, "okay": 1.0, "good": 1.75,
+}
 
 
 class JpegRecompress:
@@ -188,12 +192,29 @@ def _load_labels_store(labels_store: Path) -> list[tuple[Path, int]]:
 
 
 def mixup_batch(
-    x: torch.Tensor, y_targets: torch.Tensor, alpha: float = MIXUP_ALPHA,
+    x: torch.Tensor,
+    y_targets: torch.Tensor,
+    y_labels: torch.Tensor,
+    alpha: float = MIXUP_ALPHA,
+    good_alpha: float = MIXUP_ALPHA_GOOD_PAIR,
+    good_idx: int = LABEL_TO_IDX["good"],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    lam = float(np.random.beta(alpha, alpha))
-    idx = torch.randperm(x.size(0), device=x.device)
-    x_mix = lam * x + (1 - lam) * x[idx]
-    y_mix = lam * y_targets + (1 - lam) * y_targets[idx]
+    """MixUp with per-pair λ: Beta(good_alpha) when both partners are Good,
+    Beta(alpha) otherwise. ``y_labels`` carries the original integer labels
+    (before smoothing) and is used only to select the Beta distribution.
+    """
+    n = x.size(0)
+    idx = torch.randperm(n, device=x.device)
+    is_good_pair = (y_labels == good_idx) & (y_labels[idx] == good_idx)
+    is_good_np = is_good_pair.detach().cpu().numpy()
+    lam_default = np.random.beta(alpha, alpha, size=n)
+    lam_good = np.random.beta(good_alpha, good_alpha, size=n)
+    lam = np.where(is_good_np, lam_good, lam_default).astype(np.float32)
+    lam_t = torch.from_numpy(lam).to(x.device)
+    lam_x = lam_t.view(n, 1, 1, 1)
+    lam_y = lam_t.view(n, 1)
+    x_mix = lam_x * x + (1.0 - lam_x) * x[idx]
+    y_mix = lam_y * y_targets + (1.0 - lam_y) * y_targets[idx]
     return x_mix, y_mix
 
 
@@ -261,7 +282,7 @@ def train_one_epoch(
         y = y.to(device, non_blocking=True)
         y_onehot = F.one_hot(y, num_classes=N_CLASSES).float()
         y_smooth = (1.0 - smoothing) * y_onehot + smoothing / N_CLASSES
-        x_mix, y_mix = mixup_batch(x, y_smooth, alpha=MIXUP_ALPHA)
+        x_mix, y_mix = mixup_batch(x, y_smooth, y, alpha=MIXUP_ALPHA)
         logits = model(x_mix)
         loss = -(y_mix * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
         optimizer.zero_grad()
@@ -276,13 +297,12 @@ def train_one_epoch(
 def evaluate(
     model: nn.Module, loader: DataLoader, device: torch.device,
     criterion: nn.Module,
-) -> tuple[float, float, list[float]]:
+) -> tuple[float, float, list[float], list[float]]:
     model.eval()
     total_loss = 0.0
     n_seen = 0
-    correct = 0
-    per_class_correct = [0] * N_CLASSES
-    per_class_total = [0] * N_CLASSES
+    all_true: list[int] = []
+    all_pred: list[int] = []
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
@@ -291,18 +311,23 @@ def evaluate(
         total_loss += float(loss.item()) * x.size(0)
         n_seen += x.size(0)
         pred = logits.argmax(dim=1)
-        correct += int((pred == y).sum().item())
-        for c in range(N_CLASSES):
-            mask = y == c
-            per_class_total[c] += int(mask.sum().item())
-            per_class_correct[c] += int(((pred == y) & mask).sum().item())
+        all_true.extend(y.cpu().numpy().tolist())
+        all_pred.extend(pred.cpu().numpy().tolist())
     val_loss = total_loss / max(n_seen, 1)
-    val_acc = correct / max(n_seen, 1)
-    per_class_acc = [
-        per_class_correct[c] / per_class_total[c] if per_class_total[c] > 0 else float("nan")
-        for c in range(N_CLASSES)
-    ]
-    return val_loss, val_acc, per_class_acc
+    y_true = np.array(all_true)
+    y_pred = np.array(all_pred)
+    val_acc = float((y_true == y_pred).mean()) if len(y_true) else float("nan")
+    per_class_acc: list[float] = []
+    for c in range(N_CLASSES):
+        mask = y_true == c
+        n = int(mask.sum())
+        per_class_acc.append(
+            float((y_pred[mask] == c).sum()) / n if n > 0 else float("nan"),
+        )
+    _, _, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=list(range(N_CLASSES)), zero_division=0,
+    )
+    return val_loss, val_acc, per_class_acc, [float(v) for v in f1]
 
 
 @torch.no_grad()
@@ -407,6 +432,9 @@ def main() -> None:
                              "when --labels-store is the active path.")
     parser.add_argument("--output-dir", type=Path,
                         default=DEFAULT_FACE_QUALITY_MODEL.parent)
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Best-checkpoint path. Defaults to "
+                             "{output-dir}/best_model.pt when omitted.")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -472,9 +500,11 @@ def main() -> None:
     for y in train_labels:
         train_counts[y] += 1
     sample_weights = [
-        1.0 / train_counts[y] if train_counts[y] > 0 else 0.0
+        SAMPLER_BOOST[IDX_TO_LABEL[y]] / train_counts[y]
+        if train_counts[y] > 0 else 0.0
         for y in train_labels
     ]
+    logger.info("Sampler boost: %s", SAMPLER_BOOST)
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(train_labels),
@@ -496,19 +526,24 @@ def main() -> None:
     phase2_start = phase1_end + 1
     best_val_loss = float("inf")
     best_epoch = 0
-    best_path = args.output_dir / "best_model.pt"
+    best_path = args.output if args.output is not None else args.output_dir / "best_model.pt"
+    best_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Best checkpoint will be saved to %s", best_path)
     log_rows: list[dict] = []
 
     header = (
         f"{'epoch':>5} {'ph':>2} {'lr':>9} "
-        f"{'tr_loss':>9} {'val_loss':>9} {'val_acc':>8} | per-class acc (n/b/o/g)"
+        f"{'tr_loss':>9} {'val_loss':>9} {'val_acc':>8} {'f1_good':>8} "
+        f"| per-class acc (n/b/o/g)"
     )
     print(header)
     print("-" * len(header))
 
+    good_idx = LABEL_TO_IDX["good"]
+
     def _run_epoch(epoch: int, phase: int) -> tuple[float, float]:
         tr_loss = train_one_epoch(model, train_loader, optimizer, device)
-        val_loss, val_acc, per_class_acc = evaluate(
+        val_loss, val_acc, per_class_acc, per_class_f1 = evaluate(
             model, val_loader, device, val_criterion,
         )
         scheduler.step()
@@ -517,10 +552,13 @@ def main() -> None:
             f"{IDX_TO_LABEL[c][0]}={per_class_acc[c]:.2f}"
             for c in range(N_CLASSES)
         )
+        good_f1 = per_class_f1[good_idx]
         marker = "  [best]" if phase == 2 and val_loss < best_val_loss else ""
         print(
             f"{epoch:>5d} {phase:>2d} {cur_lr:>9.2e} "
-            f"{tr_loss:>9.4f} {val_loss:>9.4f} {val_acc:>8.3f} | {pc_str}{marker}"
+            f"{tr_loss:>9.4f} {val_loss:>9.4f} {val_acc:>8.3f} {good_f1:>8.3f} "
+            f"| {pc_str}{marker}",
+            flush=True,
         )
         log_rows.append({
             "epoch": epoch,
@@ -529,7 +567,9 @@ def main() -> None:
             "train_loss": tr_loss,
             "val_loss": val_loss,
             "val_acc": val_acc,
+            "f1_good": good_f1,
             **{f"acc_{IDX_TO_LABEL[c]}": per_class_acc[c] for c in range(N_CLASSES)},
+            **{f"f1_{IDX_TO_LABEL[c]}": per_class_f1[c] for c in range(N_CLASSES)},
         })
         return tr_loss, val_loss
 

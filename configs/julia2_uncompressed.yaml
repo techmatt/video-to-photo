@@ -1,0 +1,6 @@
+name: Julia2Uncompressed
+dirs_file: configs/dirs_julia2_uncompressed.txt
+long_video_threshold_s: 60
+long_video_windows: 20
+long_video_min_spacing_s: 5
+output_dir: data/julia2_uncompressed

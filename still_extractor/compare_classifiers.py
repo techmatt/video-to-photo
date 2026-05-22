@@ -5,14 +5,18 @@ same StratifiedShuffleSplit seed and test_size), then evaluates each provided
 checkpoint on the held-out val set. Prints a per-checkpoint confusion matrix
 and per-class precision/recall/F1, plus a final side-by-side summary.
 
+By default, auto-discovers all ``best_model_v*.pt`` files under
+``--checkpoint-dir`` (default ``models/face_quality/``) so new versions are
+picked up automatically.
+
 Usage:
     uv run python -m still_extractor.compare_classifiers \\
-        --checkpoints models/face_quality/best_model_v1.pt \\
-                      models/face_quality/best_model_v2.pt
+        --labels-store data/face_labels/labels.json
 """
 
 import argparse
 import logging
+import re
 from pathlib import Path
 
 # Import train_classifier first so pandas loads before torch — on Windows the
@@ -87,14 +91,33 @@ def main() -> None:
         description="Compare face-quality classifier checkpoints on the same val split.",
     )
     parser.add_argument("--labels-store", type=Path, default=DEFAULT_LABELS_STORE)
-    parser.add_argument("--checkpoints", nargs="+", type=Path, required=True,
-                        help="Two or more checkpoint paths to compare.")
+    parser.add_argument("--checkpoints", nargs="+", type=Path, default=None,
+                        help="Checkpoint paths to compare. If omitted, "
+                             "auto-discovers best_model_v*.pt in --checkpoint-dir.")
+    parser.add_argument("--checkpoint-dir", type=Path,
+                        default=Path("models/face_quality"),
+                        help="Directory scanned for best_model_v*.pt when "
+                             "--checkpoints is not provided.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Must match the seed used by train_classifier "
                              "to reproduce the same val split.")
     parser.add_argument("--test-size", type=float, default=0.1)
     parser.add_argument("--batch-size", type=int, default=32)
     args = parser.parse_args()
+
+    if args.checkpoints is None:
+        pattern = re.compile(r"best_model_v(\d+)\.pt$", re.IGNORECASE)
+        discovered: list[tuple[int, Path]] = []
+        for p in args.checkpoint_dir.glob("best_model_v*.pt"):
+            m = pattern.search(p.name)
+            if m:
+                discovered.append((int(m.group(1)), p))
+        if not discovered:
+            raise SystemExit(
+                f"No best_model_v*.pt checkpoints found under {args.checkpoint_dir}",
+            )
+        discovered.sort(key=lambda t: t[0])
+        args.checkpoints = [p for _, p in discovered]
 
     logging.basicConfig(
         level=logging.INFO,
@@ -188,8 +211,19 @@ def main() -> None:
             + " ".join(f"{v:>8.3f}" for v in r["precision"])
         )
 
+    print(f"\nPer-class F1 winner:")
+    print(f"{'class':>10} {'winner':>22} {'F1':>8}")
+    for c in range(N_CLASSES):
+        best_idx = int(np.argmax([r["f1"][c] for r in results]))
+        best = results[best_idx]
+        print(
+            f"{FACE_QUALITY_LABELS[c]:>10} "
+            f"{Path(best['path']).name:>22} "
+            f"{float(best['f1'][c]):>8.3f}"
+        )
+
     if len(results) >= 2:
-        a, b = results[0], results[1]
+        a, b = results[0], results[-1]
         print(
             f"\nDelta ({Path(b['path']).name} - {Path(a['path']).name}):"
         )
