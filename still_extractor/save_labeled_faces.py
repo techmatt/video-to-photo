@@ -1,13 +1,21 @@
-"""Export face crops for each labeled frame in labels.json.
+"""Export face crops for each labeled frame in face_labels.json.
 
-Reads `save/labels.json` (keys `{video_stem}/{kept_filename}` -> `good|okay|bad|none`),
-joins against `results.parquet` to recover `(video_path, timestamp_s, kept_path,
-face bbox, kps)`, crops the face from the keeper JPEG using the same roll-corrected
-crop the labeling UI showed, and writes a self-contained `labels/` folder.
+Reads `{output_dir}/face_labels.json` (keys `{video_stem}/{kept_filename}` ->
+`good|okay|bad|none`), joins against `results.parquet` to recover
+`(video_path, timestamp_s, kept_path, face bbox, kps)`, crops the face from the
+keeper JPEG using the same roll-corrected crop the labeling UI showed, and
+writes a self-contained `faces/` folder plus an appended `labels.json` manifest.
+
+Idempotent: a companion `seen_hashes.json` tracks SHA-256 of every exported JPEG
+so repeated runs (or runs across multiple corpora sharing an output dir) only
+add new crops.
+
+The core logic lives in `run_export()` so the HTTP export server can reuse it.
 """
 
 import argparse
 import hashlib
+import io
 import json
 import logging
 import os
@@ -70,6 +78,43 @@ def _atomic_write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
+def _load_seen_hashes(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Could not parse %s (%s); treating as empty", path, e)
+        return set()
+    if not isinstance(data, list):
+        logger.warning("%s is not a JSON list; treating as empty", path)
+        return set()
+    return {str(h) for h in data if isinstance(h, str)}
+
+
+def _load_existing_labels(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Could not parse %s (%s); starting fresh", path, e)
+        return []
+    if not isinstance(data, list):
+        logger.warning("%s is not a JSON list; starting fresh", path)
+        return []
+    return data
+
+
+def _derive_corpus(cfg: RunConfig | None, results_path: Path) -> str:
+    if cfg is not None:
+        return cfg.name
+    stem = results_path.stem
+    if stem == "results":
+        return results_path.parent.name
+    return stem
+
+
 def build_lookup(results_df: pd.DataFrame) -> dict[str, int]:
     """Map `{stem}/{kept_filename}` -> row index in results_df."""
     lookup: dict[str, int] = {}
@@ -87,49 +132,44 @@ def build_lookup(results_df: pd.DataFrame) -> dict[str, int]:
     return lookup
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Export face crops for labeled frames listed in labels.json.",
-    )
-    parser.add_argument("--config", type=Path, default=None,
-                        help="Run YAML config. When provided, --results defaults to "
-                             "{output_dir}/results.parquet. Explicit flag still overrides.")
-    parser.add_argument("--labels-json", type=Path, default=Path("save/labels.json"),
-                        help="Path to labels.json (keys: '{stem}/{kept_filename}').")
-    parser.add_argument("--results", type=Path, default=None,
-                        help="Path to results.parquet with kept_path + face bbox.")
-    parser.add_argument("--output-dir", type=Path, default=Path("data/face_labels"),
-                        help="Output directory (will contain faces/ and labels.json).")
-    parser.add_argument("--log-level", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    args = parser.parse_args()
+def run_export(
+    labels_json_path: Path,
+    results_path: Path,
+    output_dir: Path,
+    corpus_name: str,
+) -> dict:
+    """Run the full face-crop export pipeline.
 
-    logging.basicConfig(
-        level=args.log_level,
-        format="%(asctime)s %(levelname)s %(message)s",
-        force=True,
-    )
+    Reads labels from `labels_json_path`, joins against `results_path`, writes new
+    face crops to `output_dir/faces/`, updates `output_dir/labels.json` and
+    `output_dir/seen_hashes.json` (both idempotent via SHA-256 dedup).
 
-    if args.config is not None:
-        cfg = RunConfig.from_yaml(args.config)
-        if args.results is None:
-            args.results = cfg.output_dir / "results.parquet"
-    if args.results is None:
-        parser.error("--results is required when --config is not provided")
+    Returns counts: `new`, `skipped_already_exported`, `skipped_no_match`,
+    `skipped_image_error`, `total_in_store`, `corpus`.
+    """
+    labels_in = json.loads(Path(labels_json_path).read_text(encoding="utf-8"))
+    logger.info("Loaded %d labels from %s", len(labels_in), labels_json_path)
 
-    labels_in = json.loads(args.labels_json.read_text(encoding="utf-8"))
-    logger.info("Loaded %d labels from %s", len(labels_in), args.labels_json)
-
-    results_df = pd.read_parquet(args.results)
-    logger.info("Results parquet %s: %d rows", args.results, len(results_df))
+    results_df = pd.read_parquet(results_path)
+    logger.info("Results parquet %s: %d rows", results_path, len(results_df))
 
     lookup = build_lookup(results_df)
     logger.info("Built lookup with %d unique card keys", len(lookup))
 
-    faces_dir = args.output_dir / "faces"
+    output_dir = Path(output_dir)
+    faces_dir = output_dir / "faces"
     faces_dir.mkdir(parents=True, exist_ok=True)
 
-    exported: list[dict] = []
+    seen_hashes_path = output_dir / "seen_hashes.json"
+    seen_hashes = _load_seen_hashes(seen_hashes_path)
+    logger.info("Loaded %d hashes from %s", len(seen_hashes), seen_hashes_path)
+
+    out_labels_json = output_dir / "labels.json"
+    exported: list[dict] = _load_existing_labels(out_labels_json)
+    logger.info("Loaded %d existing entries from %s", len(exported), out_labels_json)
+
+    new_count = 0
+    dedup_skipped = 0
     missed: list[str] = []
     skipped_image: list[str] = []
 
@@ -172,46 +212,123 @@ def main() -> None:
             skipped_image.append(key)
             continue
 
+        try:
+            buf = io.BytesIO()
+            crop.save(buf, format="JPEG", quality=92)
+            jpeg_bytes = buf.getvalue()
+        except Exception as e:
+            logger.warning("Skipping %s: failed to encode JPEG (%s)", key, e)
+            skipped_image.append(key)
+            continue
+
+        jpeg_sha256 = _sha256_hex(jpeg_bytes)
+        if jpeg_sha256 in seen_hashes:
+            logger.debug("Skipping %s: already exported (sha256 match)", key)
+            dedup_skipped += 1
+            continue
+
         natural_key = f"{video_path}|{timestamp_s}"
         sha256_12 = hashlib.sha256(natural_key.encode("utf-8")).hexdigest()[:12]
         out_name = f"{sha256_12}_{stem}_{timestamp_s:.3f}.jpg"
         out_path = faces_dir / out_name
 
         try:
-            crop.save(out_path, format="JPEG", quality=92)
+            out_path.write_bytes(jpeg_bytes)
         except Exception as e:
             logger.warning("Skipping %s: failed to save crop %s (%s)", key, out_path, e)
             skipped_image.append(key)
             continue
 
-        jpeg_sha256 = _sha256_hex(out_path.read_bytes())
+        seen_hashes.add(jpeg_sha256)
         exported.append({
             "video_path": video_path,
             "timestamp_s": timestamp_s,
             "label": LABEL_TITLE_CASE[label_lc],
             "face_crop_path": _to_fwd_slash(out_path),
             "sha256": jpeg_sha256,
+            "corpus": corpus_name,
         })
+        new_count += 1
 
-    out_labels_json = args.output_dir / "labels.json"
     _atomic_write_json(out_labels_json, exported)
+    _atomic_write_json(seen_hashes_path, sorted(seen_hashes))
 
     total = len(labels_in)
     matched = total - len(missed)
     logger.info("=" * 60)
-    logger.info("Total in labels.json: %d", total)
+    logger.info("Corpus: %s", corpus_name)
+    logger.info("Total in face_labels.json: %d", total)
     logger.info("Matched to a results-parquet row: %d", matched)
-    logger.info("Exported: %d", len(exported))
+    logger.info("Already exported (skipped): %d", dedup_skipped)
+    logger.info("New this run: %d", new_count)
+    logger.info("Total in seen_hashes.json: %d", len(seen_hashes))
     logger.info("Missed (no matching row): %d", len(missed))
     if skipped_image:
         logger.info("Skipped (image read/crop/save failed): %d", len(skipped_image))
-    logger.info("Wrote %s", out_labels_json)
+    logger.info("Wrote %s (%d entries)", out_labels_json, len(exported))
+    logger.info("Wrote %s", seen_hashes_path)
     logger.info("Face crops in %s", faces_dir)
 
     if missed:
         logger.info("--- missed keys (%d) ---", len(missed))
         for k in missed:
             logger.info("  %s", k)
+
+    return {
+        "new": new_count,
+        "skipped_already_exported": dedup_skipped,
+        "skipped_no_match": len(missed),
+        "skipped_image_error": len(skipped_image),
+        "total_in_store": len(seen_hashes),
+        "corpus": corpus_name,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Export face crops for labeled frames listed in face_labels.json.",
+    )
+    parser.add_argument("--config", type=Path, default=None,
+                        help="Run YAML config. When provided, --results defaults to "
+                             "{output_dir}/results.parquet and --labels-json defaults to "
+                             "{output_dir}/face_labels.json. Explicit flags still override.")
+    parser.add_argument("--labels-json", type=Path, default=None,
+                        help="Path to face_labels.json (keys: '{stem}/{kept_filename}'). "
+                             "Defaults to {output_dir}/face_labels.json when --config is given.")
+    parser.add_argument("--results", type=Path, default=None,
+                        help="Path to results.parquet with kept_path + face bbox.")
+    parser.add_argument("--output-dir", type=Path, default=Path("data/face_labels"),
+                        help="Output directory (will contain faces/, labels.json, seen_hashes.json).")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=args.log_level,
+        format="%(asctime)s %(levelname)s %(message)s",
+        force=True,
+    )
+
+    cfg: RunConfig | None = None
+    if args.config is not None:
+        cfg = RunConfig.from_yaml(args.config)
+        if args.results is None:
+            args.results = cfg.output_dir / "results.parquet"
+        if args.labels_json is None:
+            args.labels_json = cfg.output_dir / "face_labels.json"
+    if args.results is None:
+        parser.error("--results is required when --config is not provided")
+    if args.labels_json is None:
+        parser.error("--labels-json is required when --config is not provided")
+
+    corpus = _derive_corpus(cfg, args.results)
+
+    run_export(
+        labels_json_path=args.labels_json,
+        results_path=args.results,
+        output_dir=args.output_dir,
+        corpus_name=corpus,
+    )
 
 
 if __name__ == "__main__":

@@ -299,12 +299,17 @@ function sortCards(mode) {
   });
 }
 
-function exportLabels() {
+function collectLabels() {
   const out = {};
   document.querySelectorAll('.card').forEach(card => {
     const lbl = getLabel(card);
     if (lbl) out[card.dataset.filename] = lbl;
   });
+  return out;
+}
+
+function downloadLabelsJson() {
+  const out = collectLabels();
   const blob = new Blob([JSON.stringify(out, null, 2)], {type: 'application/json'});
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -314,6 +319,55 @@ function exportLabels() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+async function exportLabels() {
+  const SERVER = "http://localhost:7432/export";
+  const TIMEOUT_MS = 10000;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    const resp = await fetch(SERVER, {
+      method: "POST",
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: resp.statusText }));
+      alert(
+        `Export failed (server error):\n${err.error || resp.statusText}\n\n` +
+        `Make sure the server is running:\n` +
+        `uv run python -m still_extractor.launch_faces_export_server --config configs/june27.yaml`
+      );
+      return;
+    }
+
+    const result = await resp.json();
+    alert(
+      `Export complete!\n\n` +
+      `New faces added:       ${result.new}\n` +
+      `Already in store:      ${result.skipped_already_exported}\n` +
+      `No parquet match:      ${result.skipped_no_match}\n` +
+      `Image errors:          ${result.skipped_image_error}\n` +
+      `Total in store:        ${result.total_in_store}\n` +
+      `Corpus:                ${result.corpus}`
+    );
+
+  } catch (e) {
+    const isAbort = e.name === "AbortError";
+    const msg = isAbort
+      ? "Export server did not respond within 10 seconds."
+      : "Could not reach the export server.";
+    alert(
+      `${msg}\n\n` +
+      `Start it with:\n` +
+      `uv run python -m still_extractor.launch_faces_export_server --config configs/june27.yaml\n\n` +
+      `Falling back to downloading labels.json...`
+    );
+    downloadLabelsJson();
+  }
 }
 
 function focusedCard() {
