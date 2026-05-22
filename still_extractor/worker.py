@@ -9,7 +9,8 @@ so a single bad file never aborts a run.
 import json
 import logging
 import math
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,61 @@ logger = logging.getLogger(__name__)
 
 FACE_QUALITY_TTA_PASSES = 3
 AESTHETICS_BATCH_SIZE = 16
+
+# Per-stage timing keys. `total` is the outermost wall time and not part of the
+# per-stage breakdown. Aesthetics is included even though the prompt did not
+# name it, so the summed-stage % breakdown is comprehensive.
+STAGE_KEYS: tuple[str, ...] = (
+    "frame_sampling",
+    "temporal_dedup",
+    "uprighter",
+    "sharpness",
+    "face_detect",
+    "aesthetics",
+    "classifier",
+    "dhash_dedup",
+    "refinement",
+    "jpeg_write",
+)
+
+
+class StageTimer:
+    """Tiny accumulator for per-stage wall-clock seconds.
+
+    Use as a context manager: `with timer("face_detect"): ...`. Multiple
+    entries with the same key accumulate.
+    """
+
+    def __init__(self) -> None:
+        self.times: dict[str, float] = {}
+
+    def __call__(self, key: str) -> "_StageCtx":
+        return _StageCtx(self, key)
+
+    def add(self, key: str, dt: float) -> None:
+        self.times[key] = self.times.get(key, 0.0) + dt
+
+
+class _StageCtx:
+    __slots__ = ("timer", "key", "_t0")
+
+    def __init__(self, timer: StageTimer, key: str) -> None:
+        self.timer = timer
+        self.key = key
+        self._t0 = 0.0
+
+    def __enter__(self) -> "_StageCtx":
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.timer.add(self.key, time.perf_counter() - self._t0)
+
+
+@dataclass
+class FileResult:
+    keepers: list[dict]
+    stage_times_s: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -365,70 +421,81 @@ def _write_keeper_jpeg(
 ) -> Path:
     kept_dir.mkdir(parents=True, exist_ok=True)
     out_path = kept_dir / f"{composite:.4f}_{video_stem}_{timestamp_s:.3f}.jpg"
-    cv2.imwrite(str(out_path), bgr)
+    # perf: cv2.imwrite default JPEG quality is 95; 88 is imperceptible for these
+    # crops and meaningfully reduces file size and encode time.
+    cv2.imwrite(str(out_path), bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     return out_path
 
 
 def _process_image(
-    row: pd.Series, models: Models, cfg: WorkerConfig,
+    row: pd.Series, models: Models, cfg: WorkerConfig, timer: StageTimer,
 ) -> list[dict]:
     image_path = Path(row["file_path"])
-    try:
-        with Image.open(image_path) as raw:
-            pil_img = ImageOps.exif_transpose(raw).convert("RGB")
-    except Exception as e:
-        logger.warning("Failed to open image %s: %s", image_path, e)
-        return []
+    with timer("frame_sampling"):
+        try:
+            with Image.open(image_path) as raw:
+                pil_img = ImageOps.exif_transpose(raw).convert("RGB")
+        except Exception as e:
+            logger.warning("Failed to open image %s: %s", image_path, e)
+            return []
 
     # Uprighter (3-strategy TTA for images; cheap since N=1).
     uprighter_pred_deg, uprighter_confidence = 0, 0.0
     if models.uprighter_model is not None:
-        pred_deg, conf = _uprighter_predict(
-            models.uprighter_model, pil_img, models.device, use_tta=True,
-        )
-        if conf >= cfg.uprighter_confidence and pred_deg != 0:
-            pil_img = _rotate_pil_cw(pil_img, pred_deg)
-            uprighter_pred_deg = pred_deg
-        uprighter_confidence = conf
+        with timer("uprighter"):
+            pred_deg, conf = _uprighter_predict(
+                models.uprighter_model, pil_img, models.device, use_tta=True,
+            )
+            if conf >= cfg.uprighter_confidence and pred_deg != 0:
+                pil_img = _rotate_pil_cw(pil_img, pred_deg)
+                uprighter_pred_deg = pred_deg
+            uprighter_confidence = conf
 
-    bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    sharp = sharpness_score(bgr)
+    with timer("frame_sampling"):
+        bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    with timer("sharpness"):
+        sharp = sharpness_score(bgr)
     if sharp < cfg.sharpness_threshold:
         logger.debug("%s sharpness=%.2f DROP-sharpness", image_path.name, sharp)
         return []
 
-    face = _detect_largest_face(models.face_app, bgr, cfg.min_face_px)
+    with timer("face_detect"):
+        face = _detect_largest_face(models.face_app, bgr, cfg.min_face_px)
     if face is None:
         logger.debug("%s DROP-face", image_path.name)
         return []
 
-    aes_raw = _score_aesthetics_batch([pil_img], models)[0]
-    aesthetics_norm = float(np.clip((aes_raw - 1.0) / 9.0, 0.0, 1.0))
+    with timer("aesthetics"):
+        aes_raw = _score_aesthetics_batch([pil_img], models)[0]
+        aesthetics_norm = float(np.clip((aes_raw - 1.0) / 9.0, 0.0, 1.0))
 
     class_probs = None
     composite = aesthetics_norm
     if models.face_quality_model is not None:
-        crop = extract_face_crop_from_image(
-            pil_img,
-            face.bbox[0], face.bbox[1], face.bbox[2], face.bbox[3],
-            FACE_CROP_PADDING,
-            kps=[[float(x), float(y)] for x, y in face.kps],
-        ).resize((FACE_QUALITY_INPUT_SIZE, FACE_QUALITY_INPUT_SIZE), Image.BICUBIC)
-        class_probs = _score_classifier_batch([crop], models)[0]
-        p_good = float(class_probs[3])
-        composite = (
-            CLASSIFIER_BLEND_WEIGHT * p_good
-            + (1.0 - CLASSIFIER_BLEND_WEIGHT) * aesthetics_norm
-        )
+        with timer("classifier"):
+            crop = extract_face_crop_from_image(
+                pil_img,
+                face.bbox[0], face.bbox[1], face.bbox[2], face.bbox[3],
+                FACE_CROP_PADDING,
+                kps=[[float(x), float(y)] for x, y in face.kps],
+            ).resize((FACE_QUALITY_INPUT_SIZE, FACE_QUALITY_INPUT_SIZE), Image.BICUBIC)
+            class_probs = _score_classifier_batch([crop], models)[0]
+            p_good = float(class_probs[3])
+            composite = (
+                CLASSIFIER_BLEND_WEIGHT * p_good
+                + (1.0 - CLASSIFIER_BLEND_WEIGHT) * aesthetics_norm
+            )
 
     if composite < cfg.quality_threshold:
         return []
 
-    face_sharp = _face_sharpness_bgr(
-        bgr, face.bbox[0], face.bbox[1], face.bbox[2], face.bbox[3],
-    )
-    kept_dir = cfg.output_dir / "kept"
-    kept_path = _write_keeper_jpeg(kept_dir, image_path.stem, 0.0, composite, bgr)
+    with timer("refinement"):
+        face_sharp = _face_sharpness_bgr(
+            bgr, face.bbox[0], face.bbox[1], face.bbox[2], face.bbox[3],
+        )
+    with timer("jpeg_write"):
+        kept_dir = cfg.output_dir / "kept"
+        kept_path = _write_keeper_jpeg(kept_dir, image_path.stem, 0.0, composite, bgr)
 
     return [_build_keeper_dict(
         cfg=cfg,
@@ -496,74 +563,97 @@ def _refine_video_keeper(
 
 
 def _process_video(
-    row: pd.Series, models: Models, cfg: WorkerConfig,
+    row: pd.Series, models: Models, cfg: WorkerConfig, timer: StageTimer,
 ) -> list[dict]:
     video_path = Path(row["file_path"])
-    rotation = get_video_rotation(video_path)
+    with timer("frame_sampling"):
+        rotation = get_video_rotation(video_path)
 
-    windows = _parse_windows(row.get("sample_windows_s"))
-    if windows is not None and len(windows) > 0:
-        frame_iter = sample_frames_windowed(video_path, windows, cfg.fps, rotation=rotation)
-    else:
-        frame_iter = sample_frames(video_path, cfg.fps, rotation=rotation)
+        windows = _parse_windows(row.get("sample_windows_s"))
+        if windows is not None and len(windows) > 0:
+            frame_iter = sample_frames_windowed(video_path, windows, cfg.fps, rotation=rotation)
+        else:
+            frame_iter = sample_frames(video_path, cfg.fps, rotation=rotation)
+        iter_obj = iter(frame_iter)
 
     candidates: list[_Candidate] = []
     accepted_times: list[float] = []
 
-    try:
-        for frame_index, timestamp_s, bgr in frame_iter:
-            # Temporal dedup: skip early before running any models.
-            if any(abs(timestamp_s - t) < cfg.temporal_window_s for t in accepted_times):
-                continue
+    while True:
+        with timer("frame_sampling"):
+            try:
+                item = next(iter_obj)
+            except StopIteration:
+                item = None
+            except Exception as e:
+                logger.warning("Failed to iterate frames for %s: %s", video_path, e)
+                item = None
+        if item is None:
+            break
+        frame_index, timestamp_s, bgr = item
 
-            up_bgr, up_deg, up_conf = _maybe_uprighten_bgr(
-                bgr, models, cfg.uprighter_confidence, use_tta=False,
+        with timer("temporal_dedup"):
+            skip = any(
+                abs(timestamp_s - t) < cfg.temporal_window_s for t in accepted_times
             )
+        if skip:
+            continue
 
-            sharp = sharpness_score(up_bgr)
+        try:
+            with timer("uprighter"):
+                up_bgr, up_deg, up_conf = _maybe_uprighten_bgr(
+                    bgr, models, cfg.uprighter_confidence, use_tta=False,
+                )
+
+            with timer("sharpness"):
+                sharp = sharpness_score(up_bgr)
             if sharp < cfg.sharpness_threshold:
                 continue
 
-            face = _detect_largest_face(models.face_app, up_bgr, cfg.min_face_px)
+            with timer("face_detect"):
+                face = _detect_largest_face(models.face_app, up_bgr, cfg.min_face_px)
             if face is None:
                 continue
+        except Exception as e:
+            logger.warning("Per-frame processing failed for %s: %s", video_path, e)
+            break
 
-            accepted_times.append(timestamp_s)
-            candidates.append(_Candidate(
-                timestamp_s=timestamp_s,
-                frame_index=frame_index,
-                bgr=up_bgr,
-                face=face,
-                sharpness_center=sharp,
-                uprighter_pred_deg=up_deg,
-                uprighter_confidence=up_conf,
-            ))
-    except Exception as e:
-        logger.warning("Failed to iterate frames for %s: %s", video_path, e)
+        accepted_times.append(timestamp_s)
+        candidates.append(_Candidate(
+            timestamp_s=timestamp_s,
+            frame_index=frame_index,
+            bgr=up_bgr,
+            face=face,
+            sharpness_center=sharp,
+            uprighter_pred_deg=up_deg,
+            uprighter_confidence=up_conf,
+        ))
 
     if not candidates:
         return []
 
     # Batch score: aesthetics + classifier
     pil_frames = [_bgr_to_pil(c.bgr) for c in candidates]
-    aes_raw = _score_aesthetics_batch(pil_frames, models)
-    aes_norm = np.clip((aes_raw - 1.0) / 9.0, 0.0, 1.0).astype(np.float32)
+    with timer("aesthetics"):
+        aes_raw = _score_aesthetics_batch(pil_frames, models)
+        aes_norm = np.clip((aes_raw - 1.0) / 9.0, 0.0, 1.0).astype(np.float32)
 
     if models.face_quality_model is not None:
-        face_crops = []
-        for c, pil_img in zip(candidates, pil_frames):
-            crop = extract_face_crop_from_image(
-                pil_img,
-                c.face.bbox[0], c.face.bbox[1], c.face.bbox[2], c.face.bbox[3],
-                FACE_CROP_PADDING,
-                kps=[[float(x), float(y)] for x, y in c.face.kps],
-            ).resize((FACE_QUALITY_INPUT_SIZE, FACE_QUALITY_INPUT_SIZE), Image.BICUBIC)
-            face_crops.append(crop)
-        class_probs = _score_classifier_batch(face_crops, models)
-        composite = (
-            CLASSIFIER_BLEND_WEIGHT * class_probs[:, 3]
-            + (1.0 - CLASSIFIER_BLEND_WEIGHT) * aes_norm
-        )
+        with timer("classifier"):
+            face_crops = []
+            for c, pil_img in zip(candidates, pil_frames):
+                crop = extract_face_crop_from_image(
+                    pil_img,
+                    c.face.bbox[0], c.face.bbox[1], c.face.bbox[2], c.face.bbox[3],
+                    FACE_CROP_PADDING,
+                    kps=[[float(x), float(y)] for x, y in c.face.kps],
+                ).resize((FACE_QUALITY_INPUT_SIZE, FACE_QUALITY_INPUT_SIZE), Image.BICUBIC)
+                face_crops.append(crop)
+            class_probs = _score_classifier_batch(face_crops, models)
+            composite = (
+                CLASSIFIER_BLEND_WEIGHT * class_probs[:, 3]
+                + (1.0 - CLASSIFIER_BLEND_WEIGHT) * aes_norm
+            )
     else:
         class_probs = None
         composite = aes_norm
@@ -571,33 +661,34 @@ def _process_video(
     n = len(candidates)
     survivors = list(range(n))
 
-    # Face dHash dedup
-    face_hashes: list[imagehash.ImageHash] = []
-    for c, pil_img in zip(candidates, pil_frames):
-        crop = extract_face_crop_from_image(
-            pil_img,
-            c.face.bbox[0], c.face.bbox[1], c.face.bbox[2], c.face.bbox[3],
-            FACE_CROP_PADDING,
-        )
-        face_hashes.append(_dhash_pil(crop))
-    order = sorted(survivors, key=lambda i: -float(composite[i]))
-    survivors = _dedup_indices(face_hashes, order, cfg.face_dedup_threshold)
+    with timer("dhash_dedup"):
+        # Face dHash dedup
+        face_hashes: list[imagehash.ImageHash] = []
+        for c, pil_img in zip(candidates, pil_frames):
+            crop = extract_face_crop_from_image(
+                pil_img,
+                c.face.bbox[0], c.face.bbox[1], c.face.bbox[2], c.face.bbox[3],
+                FACE_CROP_PADDING,
+            )
+            face_hashes.append(_dhash_pil(crop))
+        order = sorted(survivors, key=lambda i: -float(composite[i]))
+        survivors = _dedup_indices(face_hashes, order, cfg.face_dedup_threshold)
 
-    # Frame dHash dedup over remaining survivors only.
-    survivor_set = set(survivors)
-    full_hashes: dict[int, imagehash.ImageHash] = {
-        i: _dhash_pil(pil_frames[i]) for i in survivor_set
-    }
-    order = sorted(survivor_set, key=lambda i: -float(composite[i]))
-    kept: list[imagehash.ImageHash] = []
-    new_survivors: list[int] = []
-    for i in order:
-        h = full_hashes[i]
-        if any((h - kh) <= cfg.frame_dedup_threshold for kh in kept):
-            continue
-        kept.append(h)
-        new_survivors.append(i)
-    survivors = new_survivors
+        # Frame dHash dedup over remaining survivors only.
+        survivor_set = set(survivors)
+        full_hashes: dict[int, imagehash.ImageHash] = {
+            i: _dhash_pil(pil_frames[i]) for i in survivor_set
+        }
+        order = sorted(survivor_set, key=lambda i: -float(composite[i]))
+        kept: list[imagehash.ImageHash] = []
+        new_survivors: list[int] = []
+        for i in order:
+            h = full_hashes[i]
+            if any((h - kh) <= cfg.frame_dedup_threshold for kh in kept):
+                continue
+            kept.append(h)
+            new_survivors.append(i)
+        survivors = new_survivors
 
     # Quality threshold + per-file cap
     survivors = [i for i in survivors if float(composite[i]) >= cfg.quality_threshold]
@@ -611,19 +702,21 @@ def _process_video(
     out: list[dict] = []
     for i in survivors:
         c = candidates[i]
-        best_bgr, best_ts, refined_sharp = _refine_video_keeper(
-            video_path, c, cfg, rotation=rotation,
-        )
-        # TTA uprighter confidence for the final frame metadata.
-        up_conf_final = c.uprighter_confidence
-        if models.uprighter_model is not None:
-            _, up_conf_final = _uprighter_predict(
-                models.uprighter_model, _bgr_to_pil(best_bgr), models.device,
-                use_tta=True,
+        with timer("refinement"):
+            best_bgr, best_ts, refined_sharp = _refine_video_keeper(
+                video_path, c, cfg, rotation=rotation,
             )
-        kept_path = _write_keeper_jpeg(
-            kept_dir, video_path.stem, best_ts, float(composite[i]), best_bgr,
-        )
+            # TTA uprighter confidence for the final frame metadata.
+            up_conf_final = c.uprighter_confidence
+            if models.uprighter_model is not None:
+                _, up_conf_final = _uprighter_predict(
+                    models.uprighter_model, _bgr_to_pil(best_bgr), models.device,
+                    use_tta=True,
+                )
+        with timer("jpeg_write"):
+            kept_path = _write_keeper_jpeg(
+                kept_dir, video_path.stem, best_ts, float(composite[i]), best_bgr,
+            )
         out.append(_build_keeper_dict(
             cfg=cfg,
             video_path=video_path,
@@ -645,18 +738,31 @@ def _process_video(
     return out
 
 
-def process_file(row: pd.Series, models: Models, cfg: WorkerConfig) -> list[dict]:
-    """Process one manifest row end-to-end. Never raises; returns [] on failure."""
-    if _is_truthy(row.get("is_duplicate", False)):
-        return []
-    file_type = row.get("file_type", "")
+def process_file(row: pd.Series, models: Models, cfg: WorkerConfig) -> FileResult:
+    """Process one manifest row end-to-end. Never raises; returns empty keepers on failure.
+
+    Returns a `FileResult` with both keepers and per-stage wall-clock seconds.
+    `stage_times_s["total"]` is the outermost wall time for the call.
+    """
+    timer = StageTimer()
+    t0 = time.perf_counter()
+    keepers: list[dict] = []
     try:
-        if file_type == "image":
-            return _process_image(row, models, cfg)
-        if file_type == "video":
-            return _process_video(row, models, cfg)
-        logger.warning("Unknown file_type %r for %s", file_type, row.get("file_path"))
-        return []
+        if _is_truthy(row.get("is_duplicate", False)):
+            pass
+        else:
+            file_type = row.get("file_type", "")
+            if file_type == "image":
+                keepers = _process_image(row, models, cfg, timer)
+            elif file_type == "video":
+                keepers = _process_video(row, models, cfg, timer)
+            else:
+                logger.warning(
+                    "Unknown file_type %r for %s", file_type, row.get("file_path"),
+                )
     except Exception:
         logger.exception("process_file failed for %s", row.get("file_path"))
-        return []
+        keepers = []
+    times = {k: timer.times.get(k, 0.0) for k in STAGE_KEYS}
+    times["total"] = time.perf_counter() - t0
+    return FileResult(keepers=keepers, stage_times_s=times)

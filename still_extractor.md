@@ -29,7 +29,7 @@ EXIF orient → uprighter → sharpness gate → face detect → score → write
 | Module | Role |
 |---|---|
 | `pipeline.py` | Main orchestrator — runs full pipeline from config |
-| `worker.py` | Per-file processor: `process_file(row, models, cfg) -> list[dict]` |
+| `worker.py` | Per-file processor: `process_file(row, models, cfg) -> FileResult` (keepers + per-stage wall-clock timings) |
 | `models.py` | Model loading: `load_models() -> Models` dataclass |
 | `sampling.py` | Frame sampling, rotation detection (tkhd parser), sharpness |
 | `inventory.py` | File crawl, dedup, manifest, `RunConfig.from_yaml()` |

@@ -27,7 +27,12 @@ from still_extractor.constants import (
 )
 from still_extractor.inventory import RunConfig, run_inventory
 from still_extractor.models import load_models
-from still_extractor.worker import WorkerConfig, _dhash_pil, process_file
+from still_extractor.worker import (
+    STAGE_KEYS,
+    WorkerConfig,
+    _dhash_pil,
+    process_file,
+)
 
 import imagehash
 from PIL import Image
@@ -151,6 +156,57 @@ def _apply_video_cap(
     return [keepers[i] for i in survivors], videos_capped
 
 
+def _aggregate_stage_times(
+    per_file: list[dict[str, float]],
+) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
+    """Aggregate per-file stage timings into total/mean/max plus a % breakdown.
+
+    Returns (stage_times_s, stage_times_pct). `stage_times_pct` is each stage's
+    share of the sum of all per-stage totals (excluding `total`), avoiding the
+    overlap confusion between stage time and end-to-end wall time.
+    """
+    n = len(per_file)
+    keys = list(STAGE_KEYS) + ["total"]
+    block: dict[str, dict[str, float]] = {}
+    for key in keys:
+        values = [d.get(key, 0.0) for d in per_file]
+        total = float(sum(values))
+        max_v = float(max(values)) if values else 0.0
+        mean_v = total / n if n else 0.0
+        block[key] = {
+            "total": total,
+            "mean_per_file": mean_v,
+            "max_per_file": max_v,
+        }
+    stage_sum = sum(block[k]["total"] for k in STAGE_KEYS)
+    pct: dict[str, float] = {}
+    for key in STAGE_KEYS:
+        pct[key] = 100.0 * block[key]["total"] / stage_sum if stage_sum > 0 else 0.0
+    return block, pct
+
+
+def _print_stage_timing_table(
+    stage_times_s: dict[str, dict[str, float]],
+    stage_times_pct: dict[str, float],
+) -> None:
+    rows = sorted(
+        STAGE_KEYS, key=lambda k: -stage_times_s[k]["total"],
+    )
+    print("Stage              Total(s)   Mean/file(s)   % of total")
+    print("──────────────────────────────────────────────────────")
+    for key in rows:
+        b = stage_times_s[key]
+        print(
+            f"{key:<18}{b['total']:>9.2f}     {b['mean_per_file']:>9.4f}     {stage_times_pct[key]:>6.2f}%",
+        )
+    total_block = stage_times_s.get("total", {"total": 0.0, "mean_per_file": 0.0})
+    print("──────────────────────────────────────────────────────")
+    print(
+        f"{'total (wall)':<18}{total_block['total']:>9.2f}     {total_block['mean_per_file']:>9.4f}",
+    )
+    print("───────────────────────────────────────")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="V2 pipeline: inventory → per-file worker → cross-file dedup → results.parquet.",
@@ -197,7 +253,6 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     status_path = output_dir / "pipeline_status.csv"
     results_path = output_dir / "results.parquet"
-    summary_path = output_dir / "pipeline_summary.json"
 
     print("═══════════════════════════════════════")
     print(f"Still Extractor — Pipeline ({cfg.name})")
@@ -249,13 +304,16 @@ def main() -> None:
 
     fresh_keepers: list[dict] = []
     n_processed = 0
+    per_file_stage_times: list[dict[str, float]] = []
     for _, row in tqdm(
         to_process_df.iterrows(), total=len(to_process_df), desc="files",
     ):
         start = time.monotonic()
-        keepers = process_file(row, models, worker_cfg)
+        result = process_file(row, models, worker_cfg)
         elapsed = time.monotonic() - start
         n_processed += 1
+        keepers = result.keepers
+        per_file_stage_times.append(result.stage_times_s)
         status = "done"
         fresh_keepers.extend(keepers)
         # Don't write status rows when test-truncating, so a real run will redo them.
@@ -287,8 +345,11 @@ def main() -> None:
     capped_survivors, videos_capped = _apply_video_cap(survivors, args.max_per_video)
     keepers_after_video_cap = len(capped_survivors)
 
-    # In test mode, write to a side file so we don't poison the production parquet.
+    # In test mode, write to side files so we don't poison the production outputs.
     parquet_out = output_dir / ("results_test.parquet" if test_mode else "results.parquet")
+    summary_path = output_dir / (
+        "pipeline_summary_test.json" if test_mode else "pipeline_summary.json"
+    )
     if capped_survivors:
         results_df = pd.DataFrame(capped_survivors)
         results_df.to_parquet(parquet_out, index=False)
@@ -305,6 +366,8 @@ def main() -> None:
         if int(k.get("uprighter_pred", 0)) != 0:
             uprighter_corrections += 1
 
+    stage_times_block, stage_times_pct = _aggregate_stage_times(per_file_stage_times)
+
     summary = {
         "config": str(args.config),
         "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -318,6 +381,8 @@ def main() -> None:
         "videos_capped": int(videos_capped),
         "pred_label_counts": pred_label_counts,
         "uprighter_corrections_applied": int(uprighter_corrections),
+        "stage_times_s": stage_times_block,
+        "stage_times_pct": stage_times_pct,
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     logger.info("Wrote summary to %s", summary_path)
@@ -331,6 +396,7 @@ def main() -> None:
     print(f"Uprighter corrections:  {uprighter_corrections}")
     print(f"pred_label_counts:      {pred_label_counts}")
     print("───────────────────────────────────────")
+    _print_stage_timing_table(stage_times_block, stage_times_pct)
 
 
 if __name__ == "__main__":
