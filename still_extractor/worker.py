@@ -32,6 +32,7 @@ from still_extractor.constants import (
     FACE_SHARPNESS_PADDING,
     IMAGENET_MEAN,
     IMAGENET_STD,
+    MAX_FACE_SLOTS,
     UPRIGHTER_INPUT_SIZE,
     UPRIGHTER_LABELS,
 )
@@ -40,6 +41,7 @@ from still_extractor.models import Models
 from still_extractor.sampling import (
     _apply_rotation,
     decode_window,
+    get_video_fps,
     get_video_rotation,
     sample_frames,
     sample_frames_windowed,
@@ -324,50 +326,49 @@ class _Candidate:
     timestamp_s: float
     frame_index: int
     bgr: np.ndarray
-    face: Any                  # InsightFace Face object
+    faces: list[Any]           # all qualifying InsightFace Face objects (largest first)
     sharpness_center: float
     uprighter_pred_deg: int
     uprighter_confidence: float
 
 
-def _detect_largest_face(face_app, bgr: np.ndarray, min_face_px: int):
+def _detect_qualifying_faces(face_app, bgr: np.ndarray, min_face_px: int) -> list:
+    """Return all qualifying faces, largest first. Empty list if none."""
     try:
         faces = face_app.get(bgr)
     except Exception as e:
         logger.warning("InsightFace failed: %s", e)
-        return None
+        return []
     if not faces:
-        return None
+        return []
     qualifying = [f for f in faces if float(f.bbox[2] - f.bbox[0]) >= min_face_px]
-    if not qualifying:
-        return None
-    return max(qualifying, key=lambda f: float(
-        (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
-    ))
+    qualifying.sort(
+        key=lambda f: float((f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])),
+        reverse=True,
+    )
+    return qualifying
 
 
 # --- Image and video processing ---------------------------------------------
 
-def _build_keeper_dict(
-    *,
-    cfg: WorkerConfig,
-    video_path: Path,
-    source_type: str,
-    timestamp_s: float,
-    refined_timestamp_s: float,
-    frame_index: int,
-    bgr: np.ndarray,
-    face,
-    sharpness_center: float,
-    refined_sharpness: float,
-    aesthetics_norm: float,
-    composite: float,
-    class_probs: np.ndarray | None,
-    uprighter_pred_deg: int,
-    uprighter_confidence: float,
-    kept_path: Path,
-) -> dict:
-    h, w = bgr.shape[:2]
+def _face_slot_columns(face, class_probs: np.ndarray | None, slot: int) -> dict:
+    """Per-slot columns face_{slot}_*. `face`/`class_probs` may be None for empty slots."""
+    prefix = f"face_{slot}_"
+    if face is None:
+        return {
+            f"{prefix}x1": None,
+            f"{prefix}y1": None,
+            f"{prefix}x2": None,
+            f"{prefix}y2": None,
+            f"{prefix}det_score": None,
+            f"{prefix}kps": None,
+            f"{prefix}p_none": None,
+            f"{prefix}p_bad": None,
+            f"{prefix}p_okay": None,
+            f"{prefix}p_good": None,
+            f"{prefix}pred_label": None,
+            f"{prefix}pred_confidence": None,
+        }
     bbox = face.bbox
     if class_probs is None:
         p_none = p_bad = p_okay = p_good = float("nan")
@@ -382,6 +383,84 @@ def _build_keeper_dict(
         pred_label = FACE_QUALITY_LABELS[idx]
         pred_confidence = float(class_probs[idx])
     return {
+        f"{prefix}x1": int(bbox[0]),
+        f"{prefix}y1": int(bbox[1]),
+        f"{prefix}x2": int(bbox[2]),
+        f"{prefix}y2": int(bbox[3]),
+        f"{prefix}det_score": float(face.det_score),
+        f"{prefix}kps": json.dumps([[float(x), float(y)] for x, y in face.kps]),
+        f"{prefix}p_none": p_none,
+        f"{prefix}p_bad": p_bad,
+        f"{prefix}p_okay": p_okay,
+        f"{prefix}p_good": p_good,
+        f"{prefix}pred_label": pred_label,
+        f"{prefix}pred_confidence": pred_confidence,
+    }
+
+
+def _build_keeper_dict(
+    *,
+    cfg: WorkerConfig,
+    video_path: Path,
+    source_type: str,
+    timestamp_s: float,
+    refined_timestamp_s: float,
+    frame_index: int,
+    bgr: np.ndarray,
+    faces_top: list,                       # length MAX_FACE_SLOTS, padded with None
+    faces_class_probs: list,               # length MAX_FACE_SLOTS, padded with None
+    face_count: int,
+    sharpness_center: float,
+    refined_sharpness: float,
+    aesthetics_norm: float,
+    composite: float,
+    uprighter_pred_deg: int,
+    uprighter_confidence: float,
+    kept_path: Path,
+    source_fps: float | None,
+    file_size_bytes: int,
+) -> dict:
+    h, w = bgr.shape[:2]
+    face_1 = faces_top[0]
+    face_1_probs = faces_class_probs[0]
+    if face_1 is None:
+        raise ValueError("face_1 must be non-null in a keeper row")
+
+    face_1_cols = _face_slot_columns(face_1, face_1_probs, slot=1)
+    face_2_cols = _face_slot_columns(faces_top[1], faces_class_probs[1], slot=2)
+    face_3_cols = _face_slot_columns(faces_top[2], faces_class_probs[2], slot=3)
+
+    # Legacy face_* columns mirror face_1_* exactly.
+    legacy_face_cols = {
+        "face_x1": face_1_cols["face_1_x1"],
+        "face_y1": face_1_cols["face_1_y1"],
+        "face_x2": face_1_cols["face_1_x2"],
+        "face_y2": face_1_cols["face_1_y2"],
+        "face_w": int(face_1.bbox[2] - face_1.bbox[0]),
+        "face_det_score": face_1_cols["face_1_det_score"],
+        "kps": face_1_cols["face_1_kps"],
+        "embedding": json.dumps([float(v) for v in face_1.normed_embedding]),
+        "p_none": face_1_cols["face_1_p_none"],
+        "p_bad": face_1_cols["face_1_p_bad"],
+        "p_okay": face_1_cols["face_1_p_okay"],
+        "p_good": face_1_cols["face_1_p_good"],
+        "pred_label": face_1_cols["face_1_pred_label"],
+        "pred_confidence": face_1_cols["face_1_pred_confidence"],
+    }
+
+    # best_pair_score: avg of face_1.p_good and face_2.p_good. None if no face_2.
+    if (
+        faces_top[1] is not None
+        and faces_class_probs[0] is not None
+        and faces_class_probs[1] is not None
+    ):
+        best_pair_score: float | None = float(
+            (faces_class_probs[0][3] + faces_class_probs[1][3]) / 2.0,
+        )
+    else:
+        best_pair_score = None
+
+    out: dict = {
         "video_path": str(video_path.resolve()),
         "video_stem": video_path.stem,
         "source_type": source_type,
@@ -390,29 +469,25 @@ def _build_keeper_dict(
         "frame_index": int(frame_index),
         "frame_w": int(w),
         "frame_h": int(h),
-        "face_x1": int(bbox[0]),
-        "face_y1": int(bbox[1]),
-        "face_x2": int(bbox[2]),
-        "face_y2": int(bbox[3]),
-        "face_w": int(bbox[2] - bbox[0]),
-        "face_det_score": float(face.det_score),
-        "kps": json.dumps([[float(x), float(y)] for x, y in face.kps]),
-        "embedding": json.dumps([float(v) for v in face.normed_embedding]),
+        **legacy_face_cols,
         "sharpness_center": float(sharpness_center),
         "refined_sharpness": float(refined_sharpness),
         "sharpness_delta": float(refined_sharpness - sharpness_center),
         "aesthetics_norm": float(aesthetics_norm),
         "composite": float(composite),
-        "p_none": p_none,
-        "p_bad": p_bad,
-        "p_okay": p_okay,
-        "p_good": p_good,
-        "pred_label": pred_label,
-        "pred_confidence": pred_confidence,
         "uprighter_pred": int(uprighter_pred_deg),
         "uprighter_confidence": float(uprighter_confidence),
         "kept_path": str(kept_path.resolve()),
+        # New schema additions:
+        "face_count": int(face_count),
+        **face_1_cols,
+        **face_2_cols,
+        **face_3_cols,
+        "best_pair_score": best_pair_score,
+        "source_fps": source_fps,
+        "file_size_bytes": int(file_size_bytes),
     }
+    return out
 
 
 def _write_keeper_jpeg(
@@ -427,10 +502,33 @@ def _write_keeper_jpeg(
     return out_path
 
 
+def _rank_faces_by_p_good(
+    faces: list, class_probs_list: list,
+) -> tuple[list, list]:
+    """Sort faces by p_good descending. Returns (sorted_faces, sorted_class_probs).
+
+    `class_probs_list` is parallel to `faces`. Entries may be None if the
+    classifier did not run; those rank last.
+    """
+    def key(i: int) -> float:
+        cp = class_probs_list[i]
+        return -float(cp[3]) if cp is not None else 0.0
+    order = sorted(range(len(faces)), key=key)
+    return [faces[i] for i in order], [class_probs_list[i] for i in order]
+
+
+def _pad_to_slots(seq: list, n: int) -> list:
+    out = list(seq[:n])
+    while len(out) < n:
+        out.append(None)
+    return out
+
+
 def _process_image(
     row: pd.Series, models: Models, cfg: WorkerConfig, timer: StageTimer,
 ) -> list[dict]:
     image_path = Path(row["file_path"])
+    file_size_bytes = int(image_path.stat().st_size)
     with timer("frame_sampling"):
         try:
             with Image.open(image_path) as raw:
@@ -460,38 +558,52 @@ def _process_image(
         return []
 
     with timer("face_detect"):
-        face = _detect_largest_face(models.face_app, bgr, cfg.min_face_px)
-    if face is None:
+        faces = _detect_qualifying_faces(models.face_app, bgr, cfg.min_face_px)
+    if not faces:
         logger.debug("%s DROP-face", image_path.name)
         return []
+    face_count = len(faces)
 
     with timer("aesthetics"):
         aes_raw = _score_aesthetics_batch([pil_img], models)[0]
         aesthetics_norm = float(np.clip((aes_raw - 1.0) / 9.0, 0.0, 1.0))
 
-    class_probs = None
-    composite = aesthetics_norm
+    face_class_probs: list = [None] * len(faces)
     if models.face_quality_model is not None:
         with timer("classifier"):
-            crop = extract_face_crop_from_image(
-                pil_img,
-                face.bbox[0], face.bbox[1], face.bbox[2], face.bbox[3],
-                FACE_CROP_PADDING,
-                kps=[[float(x), float(y)] for x, y in face.kps],
-            ).resize((FACE_QUALITY_INPUT_SIZE, FACE_QUALITY_INPUT_SIZE), Image.BICUBIC)
-            class_probs = _score_classifier_batch([crop], models)[0]
-            p_good = float(class_probs[3])
-            composite = (
-                CLASSIFIER_BLEND_WEIGHT * p_good
-                + (1.0 - CLASSIFIER_BLEND_WEIGHT) * aesthetics_norm
-            )
+            crops = []
+            for face in faces:
+                crop = extract_face_crop_from_image(
+                    pil_img,
+                    face.bbox[0], face.bbox[1], face.bbox[2], face.bbox[3],
+                    FACE_CROP_PADDING,
+                    kps=[[float(x), float(y)] for x, y in face.kps],
+                ).resize(
+                    (FACE_QUALITY_INPUT_SIZE, FACE_QUALITY_INPUT_SIZE),
+                    Image.BICUBIC,
+                )
+                crops.append(crop)
+            all_probs = _score_classifier_batch(crops, models)
+            face_class_probs = [all_probs[i] for i in range(len(faces))]
+
+    faces_ranked, probs_ranked = _rank_faces_by_p_good(faces, face_class_probs)
+    face_1_probs = probs_ranked[0]
+    if face_1_probs is not None:
+        p_good = float(face_1_probs[3])
+        composite = (
+            CLASSIFIER_BLEND_WEIGHT * p_good
+            + (1.0 - CLASSIFIER_BLEND_WEIGHT) * aesthetics_norm
+        )
+    else:
+        composite = aesthetics_norm
 
     if composite < cfg.quality_threshold:
         return []
 
+    face_1 = faces_ranked[0]
     with timer("refinement"):
         face_sharp = _face_sharpness_bgr(
-            bgr, face.bbox[0], face.bbox[1], face.bbox[2], face.bbox[3],
+            bgr, face_1.bbox[0], face_1.bbox[1], face_1.bbox[2], face_1.bbox[3],
         )
     with timer("jpeg_write"):
         kept_dir = cfg.output_dir / "kept"
@@ -505,15 +617,18 @@ def _process_image(
         refined_timestamp_s=0.0,
         frame_index=0,
         bgr=bgr,
-        face=face,
+        faces_top=_pad_to_slots(faces_ranked, MAX_FACE_SLOTS),
+        faces_class_probs=_pad_to_slots(probs_ranked, MAX_FACE_SLOTS),
+        face_count=face_count,
         sharpness_center=sharp,
         refined_sharpness=face_sharp,
         aesthetics_norm=aesthetics_norm,
         composite=composite,
-        class_probs=class_probs,
         uprighter_pred_deg=uprighter_pred_deg,
         uprighter_confidence=uprighter_confidence,
         kept_path=kept_path,
+        source_fps=None,
+        file_size_bytes=file_size_bytes,
     )]
 
 
@@ -536,7 +651,8 @@ def _is_truthy(v) -> bool:
 
 
 def _refine_video_keeper(
-    video_path: Path, candidate: _Candidate, cfg: WorkerConfig, rotation: int,
+    video_path: Path, candidate: _Candidate, anchor_face, cfg: WorkerConfig,
+    rotation: int,
 ) -> tuple[np.ndarray, float, float]:
     """Decode ±refine_window_s around candidate, pick highest face-crop sharpness."""
     frames = decode_window(
@@ -545,8 +661,8 @@ def _refine_video_keeper(
     if not frames:
         return candidate.bgr, candidate.timestamp_s, candidate.sharpness_center
 
-    x1, y1 = float(candidate.face.bbox[0]), float(candidate.face.bbox[1])
-    x2, y2 = float(candidate.face.bbox[2]), float(candidate.face.bbox[3])
+    x1, y1 = float(anchor_face.bbox[0]), float(anchor_face.bbox[1])
+    x2, y2 = float(anchor_face.bbox[2]), float(anchor_face.bbox[3])
     # Frames decoded here are in original (pre-uprighter) orientation. Apply the
     # same uprighter rotation we applied to the candidate so the face bbox lines
     # up with the refined frame.
@@ -566,6 +682,8 @@ def _process_video(
     row: pd.Series, models: Models, cfg: WorkerConfig, timer: StageTimer,
 ) -> list[dict]:
     video_path = Path(row["file_path"])
+    file_size_bytes = int(video_path.stat().st_size)
+    source_fps = get_video_fps(video_path)
     with timer("frame_sampling"):
         rotation = get_video_rotation(video_path)
 
@@ -611,8 +729,10 @@ def _process_video(
                 continue
 
             with timer("face_detect"):
-                face = _detect_largest_face(models.face_app, up_bgr, cfg.min_face_px)
-            if face is None:
+                faces = _detect_qualifying_faces(
+                    models.face_app, up_bgr, cfg.min_face_px,
+                )
+            if not faces:
                 continue
         except Exception as e:
             logger.warning("Per-frame processing failed for %s: %s", video_path, e)
@@ -623,7 +743,7 @@ def _process_video(
             timestamp_s=timestamp_s,
             frame_index=frame_index,
             bgr=up_bgr,
-            face=face,
+            faces=faces,
             sharpness_center=sharp,
             uprighter_pred_deg=up_deg,
             uprighter_confidence=up_conf,
@@ -632,42 +752,70 @@ def _process_video(
     if not candidates:
         return []
 
-    # Batch score: aesthetics + classifier
+    n = len(candidates)
+    face_counts = [len(c.faces) for c in candidates]
+
+    # Batch score: aesthetics on whole frames; classifier on every qualifying face.
     pil_frames = [_bgr_to_pil(c.bgr) for c in candidates]
     with timer("aesthetics"):
         aes_raw = _score_aesthetics_batch(pil_frames, models)
         aes_norm = np.clip((aes_raw - 1.0) / 9.0, 0.0, 1.0).astype(np.float32)
 
+    # Classifier: build one crop per face, batched across candidates.
+    per_cand_face_probs: list[list] = [[None] * len(c.faces) for c in candidates]
     if models.face_quality_model is not None:
         with timer("classifier"):
-            face_crops = []
-            for c, pil_img in zip(candidates, pil_frames):
-                crop = extract_face_crop_from_image(
-                    pil_img,
-                    c.face.bbox[0], c.face.bbox[1], c.face.bbox[2], c.face.bbox[3],
-                    FACE_CROP_PADDING,
-                    kps=[[float(x), float(y)] for x, y in c.face.kps],
-                ).resize((FACE_QUALITY_INPUT_SIZE, FACE_QUALITY_INPUT_SIZE), Image.BICUBIC)
-                face_crops.append(crop)
-            class_probs = _score_classifier_batch(face_crops, models)
-            composite = (
-                CLASSIFIER_BLEND_WEIGHT * class_probs[:, 3]
-                + (1.0 - CLASSIFIER_BLEND_WEIGHT) * aes_norm
-            )
-    else:
-        class_probs = None
-        composite = aes_norm
+            all_crops: list = []
+            crop_index: list[tuple[int, int]] = []  # (cand_idx, face_idx)
+            for ci, (c, pil_img) in enumerate(zip(candidates, pil_frames)):
+                for fi, face in enumerate(c.faces):
+                    crop = extract_face_crop_from_image(
+                        pil_img,
+                        face.bbox[0], face.bbox[1], face.bbox[2], face.bbox[3],
+                        FACE_CROP_PADDING,
+                        kps=[[float(x), float(y)] for x, y in face.kps],
+                    ).resize(
+                        (FACE_QUALITY_INPUT_SIZE, FACE_QUALITY_INPUT_SIZE),
+                        Image.BICUBIC,
+                    )
+                    all_crops.append(crop)
+                    crop_index.append((ci, fi))
+            if all_crops:
+                all_probs = _score_classifier_batch(all_crops, models)
+                for k, (ci, fi) in enumerate(crop_index):
+                    per_cand_face_probs[ci][fi] = all_probs[k]
 
-    n = len(candidates)
+    # Rank each candidate's faces by p_good descending and keep top MAX_FACE_SLOTS.
+    ranked_faces: list[list] = []
+    ranked_probs: list[list] = []
+    for ci, c in enumerate(candidates):
+        f_sorted, p_sorted = _rank_faces_by_p_good(c.faces, per_cand_face_probs[ci])
+        ranked_faces.append(f_sorted[:MAX_FACE_SLOTS])
+        ranked_probs.append(p_sorted[:MAX_FACE_SLOTS])
+
+    # Composite from face_1's p_good (the highest-p_good face after ranking).
+    composite = np.zeros(n, dtype=np.float32)
+    for i in range(n):
+        face_1_probs = ranked_probs[i][0] if ranked_probs[i] else None
+        if face_1_probs is not None:
+            p_good = float(face_1_probs[3])
+            composite[i] = (
+                CLASSIFIER_BLEND_WEIGHT * p_good
+                + (1.0 - CLASSIFIER_BLEND_WEIGHT) * aes_norm[i]
+            )
+        else:
+            composite[i] = aes_norm[i]
+
     survivors = list(range(n))
 
     with timer("dhash_dedup"):
-        # Face dHash dedup
+        # Face dHash dedup, anchored on face_1.
         face_hashes: list[imagehash.ImageHash] = []
-        for c, pil_img in zip(candidates, pil_frames):
+        for i, (c, pil_img) in enumerate(zip(candidates, pil_frames)):
+            f1 = ranked_faces[i][0]
             crop = extract_face_crop_from_image(
                 pil_img,
-                c.face.bbox[0], c.face.bbox[1], c.face.bbox[2], c.face.bbox[3],
+                f1.bbox[0], f1.bbox[1], f1.bbox[2], f1.bbox[3],
                 FACE_CROP_PADDING,
             )
             face_hashes.append(_dhash_pil(crop))
@@ -702,9 +850,10 @@ def _process_video(
     out: list[dict] = []
     for i in survivors:
         c = candidates[i]
+        face_1 = ranked_faces[i][0]
         with timer("refinement"):
             best_bgr, best_ts, refined_sharp = _refine_video_keeper(
-                video_path, c, cfg, rotation=rotation,
+                video_path, c, face_1, cfg, rotation=rotation,
             )
             # TTA uprighter confidence for the final frame metadata.
             up_conf_final = c.uprighter_confidence
@@ -725,15 +874,18 @@ def _process_video(
             refined_timestamp_s=best_ts,
             frame_index=c.frame_index,
             bgr=best_bgr,
-            face=c.face,
+            faces_top=_pad_to_slots(ranked_faces[i], MAX_FACE_SLOTS),
+            faces_class_probs=_pad_to_slots(ranked_probs[i], MAX_FACE_SLOTS),
+            face_count=face_counts[i],
             sharpness_center=c.sharpness_center,
             refined_sharpness=refined_sharp,
             aesthetics_norm=float(aes_norm[i]),
             composite=float(composite[i]),
-            class_probs=class_probs[i] if class_probs is not None else None,
             uprighter_pred_deg=c.uprighter_pred_deg,
             uprighter_confidence=up_conf_final,
             kept_path=kept_path,
+            source_fps=source_fps,
+            file_size_bytes=file_size_bytes,
         ))
     return out
 

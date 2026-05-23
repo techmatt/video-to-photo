@@ -116,6 +116,24 @@ def get_video_rotation(path: Path) -> int:
     return 0
 
 
+def get_video_fps(path: Path) -> float | None:
+    """Return the average frame rate (fps) for the first video stream, or None."""
+    try:
+        container = av.open(str(path))
+        try:
+            stream = container.streams.video[0]
+            rate = stream.average_rate or stream.base_rate
+            if rate is None:
+                return None
+            fps = float(rate)
+            return fps if fps > 0 else None
+        finally:
+            container.close()
+    except Exception as e:
+        logger.warning("Failed to read fps for %s: %s", path.name, e)
+        return None
+
+
 _CV2_ROTATE_FOR_DEG = {
     90: cv2.ROTATE_90_CLOCKWISE,
     180: cv2.ROTATE_180,

@@ -15,6 +15,16 @@ FACE_QUALITY_INPUT_SIZE: int = 128
 FACE_CROP_PADDING: int = 20
 DEFAULT_FACE_QUALITY_MODEL: Path = Path("models/face_quality/best_model.pt")
 
+# Top-3 faces schema. Each frame stores up to MAX_FACE_SLOTS faces ranked by
+# p_good descending. face_1 is mirrored into the legacy face_* columns
+# (face_x1, p_good, pred_label, etc.) — downstream code still reads those.
+FACE_SLOT_COLUMNS: list[str] = [
+    "x1", "y1", "x2", "y2", "det_score", "kps",
+    "p_none", "p_bad", "p_okay", "p_good", "pred_label", "pred_confidence",
+]
+FACE_SLOTS: list[int] = [1, 2, 3]
+MAX_FACE_SLOTS: int = 3
+
 UPRIGHTER_INPUT_SIZE: int = 224
 DEFAULT_UPRIGHTER_MODEL: Path = Path("models/uprighter/best_model.pt")
 UPRIGHTER_CONFIDENCE_THRESHOLD: float = 0.95
