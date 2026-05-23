@@ -217,6 +217,24 @@ header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; }
 #overlay-scores .small { color: #9ca3af; font-size: 12px; }
 #overlay-scores .source-name { color: #f3f4f6; word-break: break-all; }
 
+.toggle-rejected-btn {
+  background: #222;
+  color: #ddd;
+  border: 1px solid #444;
+  padding: 1px 6px;
+  margin-left: 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 11px;
+}
+.toggle-rejected-btn:hover { background: #2a2a2a; }
+.toggle-rejected-btn.active {
+  background: rgba(239, 68, 68, 0.25);
+  border-color: rgba(239, 68, 68, 0.7);
+  color: #fff;
+}
+
 .bar-row {
   display: grid;
   grid-template-columns: 56px 1fr 56px;
@@ -300,6 +318,8 @@ let currentSourceFilter = 'all';
 let currentSort = 'confidence';
 let overlayIndex = -1;
 let lastLayoutContainerWidth = -1;
+let showRejected = false;
+const SHOW_REJECTED_KEY = 'photoViewer.showRejected';
 
 function flagKey(card) { return FLAG_PREFIX + card.dataset.exportPath; }
 function isFlagged(card) { return localStorage.getItem(flagKey(card)) === '1'; }
@@ -569,10 +589,17 @@ function buildScoresHtml(frame) {
 
   const faceCount = (frame.face_count != null) ? frame.face_count : '-';
   const bestPair = frame.best_pair_score;
+  const rejectedCount = (frame.rejected_face_count != null) ? frame.rejected_face_count : 0;
   let facesSection =
       `<div class="section">`
       + `<div class="label">Faces Detected</div>`
       + `<div class="value">${faceCount}</div>`;
+  const toggleLabel = showRejected ? 'Hide Rejected' : 'Show Rejected';
+  const toggleClass = showRejected ? 'toggle-rejected-btn active' : 'toggle-rejected-btn';
+  facesSection +=
+      `<div class="small">rejected: ${rejectedCount} `
+      + `<button class="${toggleClass}" id="toggle-rejected-btn">${toggleLabel}</button>`
+      + `</div>`;
   if (bestPair != null) {
     facesSection += `<div class="small">best pair score: ${fmtNum(bestPair, 2)}</div>`;
   }
@@ -709,6 +736,29 @@ function drawOverlayAnnotations() {
     }
     ctx.restore();
   }
+
+  if (showRejected) {
+    const rejected = Array.isArray(frame.rejected_faces) ? frame.rejected_faces : [];
+    for (const r of rejected) {
+      if (r.x1 == null || r.x2 == null || r.y1 == null || r.y2 == null) continue;
+      const x1 = r.x1 * sx;
+      const y1 = r.y1 * sy;
+      const x2 = r.x2 * sx;
+      const y2 = r.y2 * sy;
+      ctx.save();
+      ctx.setLineDash([6, 4]);
+      ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(239, 68, 68, 0.85)';
+      ctx.font = '500 11px ui-monospace, Menlo, Consolas, monospace';
+      ctx.textBaseline = 'bottom';
+      const labelY = y1 - 2 >= 12 ? y1 - 2 : y2 + 12;
+      ctx.fillText(r.reason || 'rejected', x1, labelY);
+      ctx.restore();
+    }
+  }
 }
 
 function openOverlay(idx) {
@@ -732,8 +782,22 @@ function openOverlay(idx) {
     drawOverlayAnnotations();
   }
 
-  document.getElementById('overlay-scores').innerHTML = buildScoresHtml(frame);
+  renderOverlayScores(frame);
   document.getElementById('overlay').classList.add('open');
+}
+
+function renderOverlayScores(frame) {
+  document.getElementById('overlay-scores').innerHTML = buildScoresHtml(frame);
+  const toggleBtn = document.getElementById('toggle-rejected-btn');
+  if (toggleBtn) {
+    toggleBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      showRejected = !showRejected;
+      localStorage.setItem(SHOW_REJECTED_KEY, showRejected ? '1' : '0');
+      renderOverlayScores(frame);
+      drawOverlayAnnotations();
+    });
+  }
 }
 
 function closeOverlay() {
@@ -777,6 +841,7 @@ function exportFlagged() {
 
 document.addEventListener('DOMContentLoaded', () => {
   restoreFlags();
+  showRejected = localStorage.getItem(SHOW_REJECTED_KEY) === '1';
   const savedFilter = localStorage.getItem(FILTER_KEY);
   const savedSourceFilter = localStorage.getItem(SOURCE_FILTER_KEY);
   const savedSort = localStorage.getItem(SORT_KEY);
@@ -889,6 +954,34 @@ def _face_slot_payload(row: pd.Series, slot: int) -> dict | None:
     }
 
 
+def _parse_rejected_faces(value) -> list[dict]:
+    """Parse rejected_faces_json column into a list of {x1,y1,x2,y2,reason} dicts."""
+    if value is None:
+        return []
+    if isinstance(value, float) and pd.isna(value):
+        return []
+    if not isinstance(value, str) or not value:
+        return []
+    try:
+        data = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    for d in data:
+        if not isinstance(d, dict):
+            continue
+        out.append({
+            "x1": _opt_int(d.get("x1")),
+            "y1": _opt_int(d.get("y1")),
+            "x2": _opt_int(d.get("x2")),
+            "y2": _opt_int(d.get("y2")),
+            "reason": str(d.get("reason", "")),
+        })
+    return out
+
+
 def _build_frame_json(
     row: pd.Series,
     kept_path: Path,
@@ -909,6 +1002,8 @@ def _build_frame_json(
     faces = [_face_slot_payload(row, slot) for slot in (1, 2, 3)]
     face_count = _opt_int(row.get("face_count"))
     best_pair_score = f(row.get("best_pair_score"))
+    rejected_faces = _parse_rejected_faces(row.get("rejected_faces_json"))
+    rejected_face_count = _opt_int(row.get("rejected_face_count")) or 0
 
     return {
         "video_basename": video_basename,
@@ -920,6 +1015,8 @@ def _build_frame_json(
         "faces": faces,
         "face_count": face_count,
         "best_pair_score": best_pair_score,
+        "rejected_faces": rejected_faces,
+        "rejected_face_count": rejected_face_count,
         "sharpness_center": f(row.get("sharpness_center")),
         "refined_sharpness": f(row.get("refined_sharpness")),
         "sharpness_delta": f(row.get("sharpness_delta")),

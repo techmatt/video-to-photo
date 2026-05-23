@@ -33,6 +33,14 @@ UPRIGHTER_LABELS: list[str] = ["0", "90", "180", "270"]
 FACE_SHARPNESS_PADDING: int = 10
 CLASSIFIER_BLEND_WEIGHT: float = 0.8
 
+# Face rejection heuristics
+# Minimum face area as fraction of frame area to pass at all
+FACE_MIN_AREA_FRAC: float = 0.004
+# Minimum face area fraction to be immune from edge rejection
+FACE_EDGE_IMMUNE_AREA_FRAC: float = 0.025
+# Edge zone: fraction of frame width/height defining the "near edge" region
+FACE_EDGE_ZONE_FRAC: float = 0.10
+
 IMAGENET_MEAN: tuple[float, float, float] = (0.485, 0.456, 0.406)
 IMAGENET_STD: tuple[float, float, float] = (0.229, 0.224, 0.225)
 

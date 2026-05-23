@@ -305,6 +305,12 @@ def main() -> None:
     fresh_keepers: list[dict] = []
     n_processed = 0
     per_file_stage_times: list[dict[str, float]] = []
+    rejection_stats: dict[str, int] = {
+        "total_faces_rejected": 0,
+        "too_small": 0,
+        "small_and_edge": 0,
+        "frames_with_all_faces_rejected": 0,
+    }
     for _, row in tqdm(
         to_process_df.iterrows(), total=len(to_process_df), desc="files",
     ):
@@ -314,6 +320,8 @@ def main() -> None:
         n_processed += 1
         keepers = result.keepers
         per_file_stage_times.append(result.stage_times_s)
+        for k, v in result.rejection_stats.items():
+            rejection_stats[k] = rejection_stats.get(k, 0) + int(v)
         status = "done"
         fresh_keepers.extend(keepers)
         # Don't write status rows when test-truncating, so a real run will redo them.
@@ -381,6 +389,7 @@ def main() -> None:
         "videos_capped": int(videos_capped),
         "pred_label_counts": pred_label_counts,
         "uprighter_corrections_applied": int(uprighter_corrections),
+        "rejection_stats": rejection_stats,
         "stage_times_s": stage_times_block,
         "stage_times_pct": stage_times_pct,
     }
@@ -395,6 +404,12 @@ def main() -> None:
     print(f"Videos capped:          {videos_capped}")
     print(f"Uprighter corrections:  {uprighter_corrections}")
     print(f"pred_label_counts:      {pred_label_counts}")
+    print(
+        f"Rejected faces:         total={rejection_stats['total_faces_rejected']} "
+        f"too_small={rejection_stats['too_small']} "
+        f"small_and_edge={rejection_stats['small_and_edge']} "
+        f"frames_all_rejected={rejection_stats['frames_with_all_faces_rejected']}"
+    )
     print("───────────────────────────────────────")
     _print_stage_timing_table(stage_times_block, stage_times_pct)
 

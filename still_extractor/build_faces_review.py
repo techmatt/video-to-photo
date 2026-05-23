@@ -596,7 +596,17 @@ def main() -> None:
         )
 
     df = pd.read_parquet(args.results)
-    logger.info("Loaded %d rows from %s", len(df), args.results)
+    frames_loaded = len(df)
+    logger.info("Loaded %d rows from %s", frames_loaded, args.results)
+
+    before = len(df)
+    df = df[df["face_x1"].notna() & df["pred_label"].notna()].reset_index(drop=True)
+    frames_filtered = before - len(df)
+    if frames_filtered:
+        logger.info(
+            "Filtered %d rows with null face columns (all faces rejected by heuristics)",
+            frames_filtered,
+        )
 
     has_pred = "pred_label" in df.columns
     if has_pred:
@@ -714,6 +724,18 @@ def main() -> None:
     summary_path = args.output_html.parent / "build_faces_review_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     logger.info("Wrote summary to %s", summary_path)
+
+    frames_with_faces = len(df)
+    if frames_filtered:
+        with_faces_line = (
+            f"Frames with faces:    {frames_with_faces}  "
+            f"({frames_filtered} filtered - no face detected)"
+        )
+    else:
+        with_faces_line = f"Frames with faces:    {frames_with_faces}"
+    print(f"Frames loaded:        {frames_loaded}")
+    print(with_faces_line)
+    print(f"Cards in HTML:        {len(cards)}")
 
 
 if __name__ == "__main__":

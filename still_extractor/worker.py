@@ -27,6 +27,9 @@ from PIL import Image, ImageOps
 from still_extractor.constants import (
     CLASSIFIER_BLEND_WEIGHT,
     FACE_CROP_PADDING,
+    FACE_EDGE_IMMUNE_AREA_FRAC,
+    FACE_EDGE_ZONE_FRAC,
+    FACE_MIN_AREA_FRAC,
     FACE_QUALITY_INPUT_SIZE,
     FACE_QUALITY_LABELS,
     FACE_SHARPNESS_PADDING,
@@ -109,6 +112,7 @@ class _StageCtx:
 class FileResult:
     keepers: list[dict]
     stage_times_s: dict[str, float] = field(default_factory=dict)
+    rejection_stats: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -305,13 +309,20 @@ def _dhash_pil(pil_img: Image.Image) -> imagehash.ImageHash:
 
 
 def _dedup_indices(
-    hashes: list[imagehash.ImageHash], order: list[int], threshold: int,
+    hashes: list, order: list[int], threshold: int,
 ) -> list[int]:
-    """Greedy dHash dedup: walk `order`, drop any hash within `threshold` of a kept one."""
+    """Greedy dHash dedup: walk `order`, drop any hash within `threshold` of a kept one.
+
+    Hashes that are None (e.g. candidates with no passing face crop) are always
+    kept and never compared against — they contribute no signal to face-dedup.
+    """
     kept: list[imagehash.ImageHash] = []
     keep_idx: list[int] = []
     for i in order:
         h = hashes[i]
+        if h is None:
+            keep_idx.append(i)
+            continue
         if any((h - kh) <= threshold for kh in kept):
             continue
         kept.append(h)
@@ -326,7 +337,8 @@ class _Candidate:
     timestamp_s: float
     frame_index: int
     bgr: np.ndarray
-    faces: list[Any]           # all qualifying InsightFace Face objects (largest first)
+    faces: list[Any]                       # post-rejection passing faces (largest first)
+    rejected_faces: list[tuple[Any, str]]  # [(face, reason), ...]
     sharpness_center: float
     uprighter_pred_deg: int
     uprighter_confidence: float
@@ -347,6 +359,120 @@ def _detect_qualifying_faces(face_app, bgr: np.ndarray, min_face_px: int) -> lis
         reverse=True,
     )
     return qualifying
+
+
+# --- Face rejection heuristics ----------------------------------------------
+
+def _check_face_rejection(
+    x1: float, y1: float, x2: float, y2: float,
+    frame_w: int, frame_h: int,
+) -> str | None:
+    """Return a rejection reason string, or None if the face passes."""
+    face_area_frac = ((x2 - x1) * (y2 - y1)) / (frame_w * frame_h)
+
+    if face_area_frac < FACE_MIN_AREA_FRAC:
+        return f"too_small({face_area_frac:.4f}<{FACE_MIN_AREA_FRAC})"
+
+    if face_area_frac < FACE_EDGE_IMMUNE_AREA_FRAC:
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        edge_x = frame_w * FACE_EDGE_ZONE_FRAC
+        edge_y = frame_h * FACE_EDGE_ZONE_FRAC
+        if cx < edge_x or cx > frame_w - edge_x or cy < edge_y or cy > frame_h - edge_y:
+            return f"small_and_edge({face_area_frac:.4f})"
+
+    return None
+
+
+def _rejection_kind(reason: str) -> str:
+    """`too_small(0.0021<0.004)` -> `too_small`. Used for stat keys and filenames."""
+    idx = reason.find("(")
+    return reason[:idx] if idx > 0 else reason
+
+
+def _split_rejected_faces(
+    faces: list, frame_w: int, frame_h: int,
+) -> tuple[list, list[tuple[Any, str]]]:
+    """Split faces into (passing, [(face, reason), ...])."""
+    passing: list = []
+    rejected: list[tuple[Any, str]] = []
+    for face in faces:
+        x1 = float(face.bbox[0])
+        y1 = float(face.bbox[1])
+        x2 = float(face.bbox[2])
+        y2 = float(face.bbox[3])
+        reason = _check_face_rejection(x1, y1, x2, y2, frame_w, frame_h)
+        if reason is None:
+            passing.append(face)
+        else:
+            rejected.append((face, reason))
+    return passing, rejected
+
+
+def _write_rejected_face_crop(
+    rejected_dir: Path, bgr: np.ndarray, face, reason: str,
+    stem: str, timestamp_s: float, face_idx: int,
+) -> None:
+    """Save a padded face crop for visual inspection. Quality 88."""
+    rejected_dir.mkdir(parents=True, exist_ok=True)
+    pil_img = _bgr_to_pil(bgr)
+    try:
+        crop = extract_face_crop_from_image(
+            pil_img,
+            face.bbox[0], face.bbox[1], face.bbox[2], face.bbox[3],
+            FACE_CROP_PADDING,
+            kps=[[float(x), float(y)] for x, y in face.kps],
+        )
+    except Exception as e:
+        logger.warning("Failed to extract rejected face crop: %s", e)
+        return
+    kind = _rejection_kind(reason)
+    out_path = rejected_dir / f"{kind}_{stem}_{timestamp_s:.3f}_{face_idx}.jpg"
+    try:
+        crop.save(out_path, "JPEG", quality=88)
+    except Exception as e:
+        logger.warning("Failed to write rejected crop %s: %s", out_path, e)
+
+
+def _build_rejected_columns(rejected: list[tuple[Any, str]]) -> dict:
+    """Build the rejection-related parquet columns for one keeper row."""
+    reasons = [reason for _, reason in rejected]
+    bboxes = []
+    for face, reason in rejected:
+        bboxes.append({
+            "x1": int(face.bbox[0]),
+            "y1": int(face.bbox[1]),
+            "x2": int(face.bbox[2]),
+            "y2": int(face.bbox[3]),
+            "reason": reason,
+        })
+    return {
+        "rejected_face_count": int(len(rejected)),
+        "rejected_face_reasons": json.dumps(reasons),
+        "rejected_faces_json": json.dumps(bboxes),
+    }
+
+
+def _empty_rejected_columns() -> dict:
+    return {
+        "rejected_face_count": 0,
+        "rejected_face_reasons": "[]",
+        "rejected_faces_json": "[]",
+    }
+
+
+def _update_rejection_stats(
+    stats: dict[str, int], passing: list, rejected: list[tuple[Any, str]],
+) -> None:
+    """Mutate stats with counts from one frame's rejection split."""
+    for _, reason in rejected:
+        stats["total_faces_rejected"] = stats.get("total_faces_rejected", 0) + 1
+        kind = _rejection_kind(reason)
+        stats[kind] = stats.get(kind, 0) + 1
+    if rejected and not passing:
+        stats["frames_with_all_faces_rejected"] = (
+            stats.get("frames_with_all_faces_rejected", 0) + 1
+        )
 
 
 # --- Image and video processing ---------------------------------------------
@@ -419,46 +545,63 @@ def _build_keeper_dict(
     kept_path: Path,
     source_fps: float | None,
     file_size_bytes: int,
+    rejected_columns: dict,
 ) -> dict:
     h, w = bgr.shape[:2]
     face_1 = faces_top[0]
     face_1_probs = faces_class_probs[0]
-    if face_1 is None:
-        raise ValueError("face_1 must be non-null in a keeper row")
 
     face_1_cols = _face_slot_columns(face_1, face_1_probs, slot=1)
     face_2_cols = _face_slot_columns(faces_top[1], faces_class_probs[1], slot=2)
     face_3_cols = _face_slot_columns(faces_top[2], faces_class_probs[2], slot=3)
 
-    # Legacy face_* columns mirror face_1_* exactly.
-    legacy_face_cols = {
-        "face_x1": face_1_cols["face_1_x1"],
-        "face_y1": face_1_cols["face_1_y1"],
-        "face_x2": face_1_cols["face_1_x2"],
-        "face_y2": face_1_cols["face_1_y2"],
-        "face_w": int(face_1.bbox[2] - face_1.bbox[0]),
-        "face_det_score": face_1_cols["face_1_det_score"],
-        "kps": face_1_cols["face_1_kps"],
-        "embedding": json.dumps([float(v) for v in face_1.normed_embedding]),
-        "p_none": face_1_cols["face_1_p_none"],
-        "p_bad": face_1_cols["face_1_p_bad"],
-        "p_okay": face_1_cols["face_1_p_okay"],
-        "p_good": face_1_cols["face_1_p_good"],
-        "pred_label": face_1_cols["face_1_pred_label"],
-        "pred_confidence": face_1_cols["face_1_pred_confidence"],
-    }
-
-    # best_pair_score: avg of face_1.p_good and face_2.p_good. None if no face_2.
-    if (
-        faces_top[1] is not None
-        and faces_class_probs[0] is not None
-        and faces_class_probs[1] is not None
-    ):
-        best_pair_score: float | None = float(
-            (faces_class_probs[0][3] + faces_class_probs[1][3]) / 2.0,
-        )
+    # Legacy face_* columns mirror face_1_* exactly. When face_1 is None
+    # (all detected faces were rejected by heuristics), columns are null.
+    if face_1 is None:
+        legacy_face_cols = {
+            "face_x1": None,
+            "face_y1": None,
+            "face_x2": None,
+            "face_y2": None,
+            "face_w": None,
+            "face_det_score": None,
+            "kps": None,
+            "embedding": None,
+            "p_none": None,
+            "p_bad": None,
+            "p_okay": None,
+            "p_good": None,
+            "pred_label": None,
+            "pred_confidence": None,
+        }
+        best_pair_score: float | None = None
     else:
-        best_pair_score = None
+        legacy_face_cols = {
+            "face_x1": face_1_cols["face_1_x1"],
+            "face_y1": face_1_cols["face_1_y1"],
+            "face_x2": face_1_cols["face_1_x2"],
+            "face_y2": face_1_cols["face_1_y2"],
+            "face_w": int(face_1.bbox[2] - face_1.bbox[0]),
+            "face_det_score": face_1_cols["face_1_det_score"],
+            "kps": face_1_cols["face_1_kps"],
+            "embedding": json.dumps([float(v) for v in face_1.normed_embedding]),
+            "p_none": face_1_cols["face_1_p_none"],
+            "p_bad": face_1_cols["face_1_p_bad"],
+            "p_okay": face_1_cols["face_1_p_okay"],
+            "p_good": face_1_cols["face_1_p_good"],
+            "pred_label": face_1_cols["face_1_pred_label"],
+            "pred_confidence": face_1_cols["face_1_pred_confidence"],
+        }
+        if (
+            faces_top[1] is not None
+            and faces_class_probs[0] is not None
+            and faces_class_probs[1] is not None
+        ):
+            best_pair_score = float(
+                (faces_class_probs[0][3] + faces_class_probs[1][3]) / 2.0,
+            )
+        else:
+            best_pair_score = None
 
     out: dict = {
         "video_path": str(video_path.resolve()),
@@ -486,6 +629,7 @@ def _build_keeper_dict(
         "best_pair_score": best_pair_score,
         "source_fps": source_fps,
         "file_size_bytes": int(file_size_bytes),
+        **rejected_columns,
     }
     return out
 
@@ -526,6 +670,7 @@ def _pad_to_slots(seq: list, n: int) -> list:
 
 def _process_image(
     row: pd.Series, models: Models, cfg: WorkerConfig, timer: StageTimer,
+    rejection_stats: dict[str, int],
 ) -> list[dict]:
     image_path = Path(row["file_path"])
     file_size_bytes = int(image_path.stat().st_size)
@@ -558,10 +703,22 @@ def _process_image(
         return []
 
     with timer("face_detect"):
-        faces = _detect_qualifying_faces(models.face_app, bgr, cfg.min_face_px)
-    if not faces:
+        detected = _detect_qualifying_faces(models.face_app, bgr, cfg.min_face_px)
+    if not detected:
         logger.debug("%s DROP-face", image_path.name)
         return []
+
+    fh, fw = bgr.shape[:2]
+    passing, rejected = _split_rejected_faces(detected, fw, fh)
+    _update_rejection_stats(rejection_stats, passing, rejected)
+    for fi, (face, reason) in enumerate(rejected):
+        _write_rejected_face_crop(
+            cfg.output_dir / "rejected", bgr, face, reason,
+            image_path.stem, 0.0, fi,
+        )
+    rejected_columns = _build_rejected_columns(rejected)
+
+    faces = passing
     face_count = len(faces)
 
     with timer("aesthetics"):
@@ -569,7 +726,7 @@ def _process_image(
         aesthetics_norm = float(np.clip((aes_raw - 1.0) / 9.0, 0.0, 1.0))
 
     face_class_probs: list = [None] * len(faces)
-    if models.face_quality_model is not None:
+    if faces and models.face_quality_model is not None:
         with timer("classifier"):
             crops = []
             for face in faces:
@@ -587,7 +744,7 @@ def _process_image(
             face_class_probs = [all_probs[i] for i in range(len(faces))]
 
     faces_ranked, probs_ranked = _rank_faces_by_p_good(faces, face_class_probs)
-    face_1_probs = probs_ranked[0]
+    face_1_probs = probs_ranked[0] if probs_ranked else None
     if face_1_probs is not None:
         p_good = float(face_1_probs[3])
         composite = (
@@ -600,11 +757,14 @@ def _process_image(
     if composite < cfg.quality_threshold:
         return []
 
-    face_1 = faces_ranked[0]
-    with timer("refinement"):
-        face_sharp = _face_sharpness_bgr(
-            bgr, face_1.bbox[0], face_1.bbox[1], face_1.bbox[2], face_1.bbox[3],
-        )
+    if faces_ranked:
+        face_1 = faces_ranked[0]
+        with timer("refinement"):
+            face_sharp = _face_sharpness_bgr(
+                bgr, face_1.bbox[0], face_1.bbox[1], face_1.bbox[2], face_1.bbox[3],
+            )
+    else:
+        face_sharp = sharp
     with timer("jpeg_write"):
         kept_dir = cfg.output_dir / "kept"
         kept_path = _write_keeper_jpeg(kept_dir, image_path.stem, 0.0, composite, bgr)
@@ -629,6 +789,7 @@ def _process_image(
         kept_path=kept_path,
         source_fps=None,
         file_size_bytes=file_size_bytes,
+        rejected_columns=rejected_columns,
     )]
 
 
@@ -655,6 +816,8 @@ def _refine_video_keeper(
     rotation: int,
 ) -> tuple[np.ndarray, float, float]:
     """Decode ±refine_window_s around candidate, pick highest face-crop sharpness."""
+    if anchor_face is None:
+        return candidate.bgr, candidate.timestamp_s, candidate.sharpness_center
     frames = decode_window(
         video_path, candidate.timestamp_s, cfg.refine_window_s, rotation=rotation,
     )
@@ -680,6 +843,7 @@ def _refine_video_keeper(
 
 def _process_video(
     row: pd.Series, models: Models, cfg: WorkerConfig, timer: StageTimer,
+    rejection_stats: dict[str, int],
 ) -> list[dict]:
     video_path = Path(row["file_path"])
     file_size_bytes = int(video_path.stat().st_size)
@@ -729,11 +893,20 @@ def _process_video(
                 continue
 
             with timer("face_detect"):
-                faces = _detect_qualifying_faces(
+                detected = _detect_qualifying_faces(
                     models.face_app, up_bgr, cfg.min_face_px,
                 )
-            if not faces:
+            if not detected:
                 continue
+
+            fh, fw = up_bgr.shape[:2]
+            passing, rejected = _split_rejected_faces(detected, fw, fh)
+            _update_rejection_stats(rejection_stats, passing, rejected)
+            for fi, (face, reason) in enumerate(rejected):
+                _write_rejected_face_crop(
+                    cfg.output_dir / "rejected", up_bgr, face, reason,
+                    video_path.stem, timestamp_s, fi,
+                )
         except Exception as e:
             logger.warning("Per-frame processing failed for %s: %s", video_path, e)
             break
@@ -743,7 +916,8 @@ def _process_video(
             timestamp_s=timestamp_s,
             frame_index=frame_index,
             bgr=up_bgr,
-            faces=faces,
+            faces=passing,
+            rejected_faces=rejected,
             sharpness_center=sharp,
             uprighter_pred_deg=up_deg,
             uprighter_confidence=up_conf,
@@ -809,9 +983,13 @@ def _process_video(
     survivors = list(range(n))
 
     with timer("dhash_dedup"):
-        # Face dHash dedup, anchored on face_1.
-        face_hashes: list[imagehash.ImageHash] = []
+        # Face dHash dedup, anchored on face_1. Candidates with no passing face
+        # contribute no signal (hash=None) and skip face-dedup.
+        face_hashes: list = []
         for i, (c, pil_img) in enumerate(zip(candidates, pil_frames)):
+            if not ranked_faces[i]:
+                face_hashes.append(None)
+                continue
             f1 = ranked_faces[i][0]
             crop = extract_face_crop_from_image(
                 pil_img,
@@ -850,7 +1028,7 @@ def _process_video(
     out: list[dict] = []
     for i in survivors:
         c = candidates[i]
-        face_1 = ranked_faces[i][0]
+        face_1 = ranked_faces[i][0] if ranked_faces[i] else None
         with timer("refinement"):
             best_bgr, best_ts, refined_sharp = _refine_video_keeper(
                 video_path, c, face_1, cfg, rotation=rotation,
@@ -886,6 +1064,7 @@ def _process_video(
             kept_path=kept_path,
             source_fps=source_fps,
             file_size_bytes=file_size_bytes,
+            rejected_columns=_build_rejected_columns(c.rejected_faces),
         ))
     return out
 
@@ -899,15 +1078,21 @@ def process_file(row: pd.Series, models: Models, cfg: WorkerConfig) -> FileResul
     timer = StageTimer()
     t0 = time.perf_counter()
     keepers: list[dict] = []
+    rejection_stats: dict[str, int] = {
+        "total_faces_rejected": 0,
+        "too_small": 0,
+        "small_and_edge": 0,
+        "frames_with_all_faces_rejected": 0,
+    }
     try:
         if _is_truthy(row.get("is_duplicate", False)):
             pass
         else:
             file_type = row.get("file_type", "")
             if file_type == "image":
-                keepers = _process_image(row, models, cfg, timer)
+                keepers = _process_image(row, models, cfg, timer, rejection_stats)
             elif file_type == "video":
-                keepers = _process_video(row, models, cfg, timer)
+                keepers = _process_video(row, models, cfg, timer, rejection_stats)
             else:
                 logger.warning(
                     "Unknown file_type %r for %s", file_type, row.get("file_path"),
@@ -917,4 +1102,6 @@ def process_file(row: pd.Series, models: Models, cfg: WorkerConfig) -> FileResul
         keepers = []
     times = {k: timer.times.get(k, 0.0) for k in STAGE_KEYS}
     times["total"] = time.perf_counter() - t0
-    return FileResult(keepers=keepers, stage_times_s=times)
+    return FileResult(
+        keepers=keepers, stage_times_s=times, rejection_stats=rejection_stats,
+    )
