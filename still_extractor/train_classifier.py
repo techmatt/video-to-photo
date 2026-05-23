@@ -36,6 +36,7 @@ from still_extractor.constants import (
     FACE_CROP_PADDING,
     FACE_QUALITY_INPUT_SIZE,
     FACE_QUALITY_LABELS,
+    FACE_SLOTS,
     IMAGENET_MEAN,
     IMAGENET_STD,
     LABEL_TO_IDX,
@@ -56,7 +57,7 @@ TRAIN_LABEL_SMOOTHING: float = 0.1
 MIXUP_ALPHA: float = 0.3
 MIXUP_ALPHA_GOOD_PAIR: float = 0.5
 SAMPLER_BOOST: dict[str, float] = {
-    "none": 1.0, "bad": 1.0, "okay": 1.0, "good": 1.75,
+    "none": 1.0, "bad": 1.0, "okay": 1.0, "good": 1.25,
 }
 
 
@@ -113,19 +114,44 @@ def _build_val_transform() -> T.Compose:
 
 
 class FaceCropDataset(Dataset):
-    """Dataset of labeled face crops loaded from disk on demand."""
+    """Dataset of labeled face crops. Real items come from disk (opened on
+    demand); synthetic items are in-memory PIL crops kept in a separate list so
+    they can be regenerated per epoch via ``replace_synthetic_none``."""
 
-    def __init__(self, items: list[tuple[Path, int]], transform) -> None:
-        self.items = items
+    def __init__(
+        self,
+        items: list[tuple[Path | Image.Image, int]],
+        transform,
+    ) -> None:
+        self.real_items: list[tuple[Path | Image.Image, int]] = list(items)
+        self.synthetic_items: list[tuple[Image.Image, int]] = []
         self.transform = transform
 
     def __len__(self) -> int:
-        return len(self.items)
+        return len(self.real_items) + len(self.synthetic_items)
 
     def __getitem__(self, idx: int):
-        path, label = self.items[idx]
-        img = Image.open(path).convert("RGB")
+        n_real = len(self.real_items)
+        if idx < n_real:
+            src, label = self.real_items[idx]
+        else:
+            src, label = self.synthetic_items[idx - n_real]
+        if isinstance(src, Image.Image):
+            img = src if src.mode == "RGB" else src.convert("RGB")
+        else:
+            img = Image.open(src).convert("RGB")
         return self.transform(img), label
+
+    def replace_synthetic_none(self, crops: list[Image.Image]) -> None:
+        """Replace the synthetic-none portion in-place. Real items untouched."""
+        none_idx = LABEL_TO_IDX["none"]
+        self.synthetic_items = [(img, none_idx) for img in crops]
+
+    def current_labels(self) -> list[int]:
+        return (
+            [lbl for _, lbl in self.real_items]
+            + [lbl for _, lbl in self.synthetic_items]
+        )
 
 
 class InMemoryCropDataset(Dataset):
@@ -189,6 +215,139 @@ def _load_labels_store(labels_store: Path) -> list[tuple[Path, int]]:
             invalid_label, len(raw), list(LABEL_TO_IDX.keys()),
         )
     return items
+
+
+def _crop_overlaps_face(
+    cx1: float, cy1: float, cx2: float, cy2: float,
+    faces: list[tuple[float, float, float, float]],
+    threshold: float = 0.10,
+) -> bool:
+    """True if any (expanded) face bbox covers more than `threshold` of the
+    crop's area."""
+    crop_area = max((cx2 - cx1) * (cy2 - cy1), 1.0)
+    for fx1, fy1, fx2, fy2 in faces:
+        ix1, iy1 = max(cx1, fx1), max(cy1, fy1)
+        ix2, iy2 = min(cx2, fx2), min(cy2, fy2)
+        if ix2 > ix1 and iy2 > iy1:
+            if ((ix2 - ix1) * (iy2 - iy1)) / crop_area > threshold:
+                return True
+    return False
+
+
+def sample_synthetic_none_crops(
+    results_parquet: Path,
+    n: int,
+    rng: np.random.Generator,
+    crop_size: int = FACE_QUALITY_INPUT_SIZE,
+    min_crop_px: int = 48,
+) -> list[Image.Image]:
+    """Sample background (non-face) square crops from keeper JPEGs to use as
+    synthetic 'none'-class training examples.
+
+    Rows are sampled uniformly from ``results_parquet``. For each, all face
+    bboxes (top-3 slots + rejected_faces_json) are expanded by
+    ``FACE_CROP_PADDING`` and the function tries up to 10 random square
+    placements per image; the first placement whose intersection with any
+    face is below 10% of the crop area is accepted, resized to
+    ``crop_size`` with PIL BILINEAR, and returned.
+    """
+    if n <= 0:
+        return []
+    df = pd.read_parquet(results_parquet)
+    keepers = df[df["kept_path"].notna() & (df["kept_path"] != "")].reset_index(drop=True)
+    if len(keepers) == 0:
+        logger.warning(
+            "No keeper rows in %s; cannot sample synthetic crops",
+            results_parquet,
+        )
+        return []
+
+    n_oversample = min(n * 3, len(keepers))
+    sampled_idx = rng.choice(len(keepers), size=n_oversample, replace=False)
+
+    out: list[Image.Image] = []
+    skipped_unreadable = 0
+    skipped_too_small = 0
+    skipped_no_placement = 0
+    for idx in sampled_idx:
+        if len(out) >= n:
+            break
+        row = keepers.iloc[int(idx)]
+        kept_path = Path(str(row["kept_path"]))
+        if not kept_path.exists():
+            skipped_unreadable += 1
+            continue
+        try:
+            img = Image.open(kept_path).convert("RGB")
+        except Exception as e:
+            logger.debug("Failed to open %s: %s", kept_path, e)
+            skipped_unreadable += 1
+            continue
+        img_w, img_h = img.size
+
+        face_boxes: list[tuple[float, float, float, float]] = []
+        for i in FACE_SLOTS:
+            x1 = row.get(f"face_{i}_x1")
+            if pd.isna(x1):
+                continue
+            y1 = row.get(f"face_{i}_y1")
+            x2 = row.get(f"face_{i}_x2")
+            y2 = row.get(f"face_{i}_y2")
+            ex1 = max(0.0, float(x1) - FACE_CROP_PADDING)
+            ey1 = max(0.0, float(y1) - FACE_CROP_PADDING)
+            ex2 = min(float(img_w), float(x2) + FACE_CROP_PADDING)
+            ey2 = min(float(img_h), float(y2) + FACE_CROP_PADDING)
+            face_boxes.append((ex1, ey1, ex2, ey2))
+
+        rj = row.get("rejected_faces_json")
+        if isinstance(rj, str) and rj:
+            try:
+                for entry in json.loads(rj):
+                    rx1 = float(entry["x1"]); ry1 = float(entry["y1"])
+                    rx2 = float(entry["x2"]); ry2 = float(entry["y2"])
+                    ex1 = max(0.0, rx1 - FACE_CROP_PADDING)
+                    ey1 = max(0.0, ry1 - FACE_CROP_PADDING)
+                    ex2 = min(float(img_w), rx2 + FACE_CROP_PADDING)
+                    ey2 = min(float(img_h), ry2 + FACE_CROP_PADDING)
+                    face_boxes.append((ex1, ey1, ex2, ey2))
+            except Exception as e:
+                logger.debug(
+                    "Failed to parse rejected_faces_json on %s: %s", kept_path, e,
+                )
+
+        max_side = min(img_w, img_h) // 2
+        if max_side < min_crop_px:
+            skipped_too_small += 1
+            continue
+
+        accepted: Image.Image | None = None
+        for _ in range(10):
+            side = int(rng.integers(low=min_crop_px, high=max_side + 1))
+            if side > img_w or side > img_h:
+                continue
+            cx1 = int(rng.integers(low=0, high=img_w - side + 1))
+            cy1 = int(rng.integers(low=0, high=img_h - side + 1))
+            cx2 = cx1 + side
+            cy2 = cy1 + side
+            if not _crop_overlaps_face(cx1, cy1, cx2, cy2, face_boxes, 0.10):
+                accepted = img.crop((cx1, cy1, cx2, cy2)).resize(
+                    (crop_size, crop_size), Image.BILINEAR,
+                )
+                break
+
+        if accepted is not None:
+            out.append(accepted)
+        else:
+            skipped_no_placement += 1
+
+    if len(out) < n:
+        logger.warning(
+            "Synthetic none sampling collected %d/%d crops "
+            "(skipped: %d unreadable, %d too-small, %d no-placement)",
+            len(out), n,
+            skipped_unreadable, skipped_too_small, skipped_no_placement,
+        )
+    return out
 
 
 def mixup_batch(
@@ -441,6 +600,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tta-passes", type=int, default=5)
     parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument(
+        "--synthetic-none-ratio", type=float, default=0.25,
+        help="Fraction of training 'none' count to add as synthetic non-face "
+             "background crops sampled from --results keepers. 0 disables.",
+    )
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -490,29 +654,53 @@ def main() -> None:
     logger.info("Train class counts: %s", _format_counts(train_labels))
     logger.info("Val   class counts: %s", _format_counts(val_labels))
 
+    n_synth_target = 0
+    synth_rng: np.random.Generator | None = None
+    if args.synthetic_none_ratio > 0:
+        if args.results is None:
+            raise SystemExit(
+                "--results is required when --synthetic-none-ratio > 0 "
+                "(synthetic crops are sampled from keeper JPEGs).",
+            )
+        none_idx = LABEL_TO_IDX["none"]
+        train_none_count = sum(1 for y in train_labels if y == none_idx)
+        n_synth_target = int(train_none_count * args.synthetic_none_ratio)
+        if n_synth_target > 0:
+            synth_rng = np.random.default_rng(args.seed)
+            logger.info(
+                "Per-epoch synthetic none resampling enabled: target n=%d "
+                "(ratio=%.3f, real none train=%d)",
+                n_synth_target, args.synthetic_none_ratio, train_none_count,
+            )
+
     train_transform = _build_train_transform()
     val_transform = _build_val_transform()
 
     train_ds = FaceCropDataset(train_items, train_transform)
     val_ds = FaceCropDataset(val_items, val_transform)
 
-    train_counts = [0] * N_CLASSES
-    for y in train_labels:
-        train_counts[y] += 1
-    sample_weights = [
-        SAMPLER_BOOST[IDX_TO_LABEL[y]] / train_counts[y]
-        if train_counts[y] > 0 else 0.0
-        for y in train_labels
-    ]
     logger.info("Sampler boost: %s", SAMPLER_BOOST)
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(train_labels),
-        replacement=True,
-    )
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=0,
-    )
+
+    def _rebuild_train_loader() -> DataLoader:
+        labels = train_ds.current_labels()
+        counts = [0] * N_CLASSES
+        for y in labels:
+            counts[y] += 1
+        weights = [
+            SAMPLER_BOOST[IDX_TO_LABEL[y]] / counts[y]
+            if counts[y] > 0 else 0.0
+            for y in labels
+        ]
+        sampler = WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(labels),
+            replacement=True,
+        )
+        return DataLoader(
+            train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=0,
+        )
+
+    train_loader = _rebuild_train_loader()
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0,
     )
@@ -540,6 +728,19 @@ def main() -> None:
     print("-" * len(header))
 
     good_idx = LABEL_TO_IDX["good"]
+
+    def _resample_synth(epoch: int) -> None:
+        nonlocal train_loader
+        if n_synth_target <= 0 or synth_rng is None:
+            return
+        crops = sample_synthetic_none_crops(
+            args.results, n_synth_target, synth_rng,
+        )
+        train_ds.replace_synthetic_none(crops)
+        train_loader = _rebuild_train_loader()
+        logger.debug(
+            "Epoch %d: resampled %d synthetic none crops", epoch, len(crops),
+        )
 
     def _run_epoch(epoch: int, phase: int) -> tuple[float, float]:
         tr_loss = train_one_epoch(model, train_loader, optimizer, device)
@@ -575,6 +776,7 @@ def main() -> None:
 
     logger.info("=== Phase 1: training head only (epochs 1-%d) ===", phase1_end)
     for epoch in range(1, phase1_end + 1):
+        _resample_synth(epoch)
         _run_epoch(epoch, phase=1)
 
     logger.info(
@@ -590,6 +792,7 @@ def main() -> None:
     patience_left = args.patience
 
     for epoch in range(phase2_start, args.epochs + 1):
+        _resample_synth(epoch)
         _, val_loss = _run_epoch(epoch, phase=2)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
