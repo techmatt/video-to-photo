@@ -1,5 +1,6 @@
 """Build a self-contained HTML photo viewer for browsing and flagging refined frames."""
 
+import base64
 import html
 import json
 import logging
@@ -11,7 +12,7 @@ from urllib.parse import quote
 import pandas as pd
 from PIL import ExifTags, Image
 
-from still_extractor.constants import IMAGE_EXTENSIONS
+from still_extractor.constants import IMAGE_EXTENSIONS, card_key
 from still_extractor.inventory import RunConfig
 from still_extractor.utils import safe_float as _safe_float, to_fwd_slash as _to_fwd_slash
 
@@ -202,6 +203,43 @@ header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; }
   font-size: 14px;
 }
 
+.face-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  align-items: center;
+}
+.face-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #222;
+  border: 2px solid #444;
+  padding: 3px 10px 3px 3px;
+  border-radius: 22px;
+  cursor: pointer;
+  font-size: 12px;
+  color: #eee;
+  transition: border-color 0.12s, background 0.12s;
+}
+.face-chip:hover { background: #2a2a2a; }
+.face-chip.active { border-color: #4a7fd0; background: #2a3a55; }
+.face-chip img,
+.face-chip .face-chip-placeholder {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #111;
+  object-fit: cover;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #888;
+  font-weight: 600;
+  font-size: 14px;
+}
+
 .legend { color: #888; font-size: 12px; margin-top: 6px; }
 .legend kbd {
   background: #2a2a2a;
@@ -219,11 +257,14 @@ JS = """
 const FILTER_KEY = 'photoViewer.filter';
 const SOURCE_FILTER_KEY = 'photoViewer.sourceFilter';
 const SORT_KEY = 'photoViewer.sort';
+const FACE_FILTER_KEY = 'photoViewer.faceFilter';
 const FLAG_PREFIX = 'flag:';
+const UNKNOWN_CHIP_ID = '__unknown__';
 
 let currentFilter = 'good';
 let currentSourceFilter = 'all';
 let currentSort = 'confidence';
+let selectedIdentities = new Set();
 let lightboxIndex = -1;
 let lastLayoutContainerWidth = -1;
 
@@ -268,12 +309,29 @@ function updateFlagCount() {
   document.getElementById('export-btn').textContent = `Export Flagged (${n})`;
 }
 
+function cardIdentities(card) {
+  const raw = card.dataset.identities || '';
+  if (!raw) return [];
+  return raw.split('|').filter(Boolean);
+}
+
 function passesFilter(card) {
   if (currentFilter !== 'all') {
     if ((card.dataset.predLabel || '').toLowerCase() !== currentFilter) return false;
   }
   if (currentSourceFilter !== 'all') {
     if (card.dataset.sourceType !== currentSourceFilter) return false;
+  }
+  if (selectedIdentities.size > 0) {
+    const ids = new Set(cardIdentities(card));
+    const hasUnknown = card.dataset.hasUnknown === 'true';
+    for (const sel of selectedIdentities) {
+      if (sel === UNKNOWN_CHIP_ID) {
+        if (!hasUnknown) return false;
+      } else if (!ids.has(sel)) {
+        return false;
+      }
+    }
   }
   return true;
 }
@@ -401,6 +459,33 @@ function setSourceFilter(f) {
   applyFilter();
 }
 
+function persistFaceFilter() {
+  localStorage.setItem(FACE_FILTER_KEY, JSON.stringify(Array.from(selectedIdentities)));
+}
+
+function refreshFaceChipState() {
+  document.querySelectorAll('.face-chip').forEach(chip => {
+    chip.classList.toggle('active', selectedIdentities.has(chip.dataset.identity));
+  });
+}
+
+function toggleFaceChip(identity) {
+  if (selectedIdentities.has(identity)) selectedIdentities.delete(identity);
+  else selectedIdentities.add(identity);
+  refreshFaceChipState();
+  persistFaceFilter();
+  applyFilter();
+}
+
+function restoreFaceFilter() {
+  try {
+    const raw = localStorage.getItem(FACE_FILTER_KEY);
+    if (!raw) return;
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) selectedIdentities = new Set(arr.filter(x => typeof x === 'string'));
+  } catch (_) { /* ignore */ }
+}
+
 function sortCards(mode) {
   currentSort = mode;
   localStorage.setItem(SORT_KEY, mode);
@@ -487,6 +572,8 @@ function exportFlagged() {
 
 document.addEventListener('DOMContentLoaded', () => {
   restoreFlags();
+  restoreFaceFilter();
+  refreshFaceChipState();
   const savedFilter = localStorage.getItem(FILTER_KEY);
   const savedSourceFilter = localStorage.getItem(SOURCE_FILTER_KEY);
   const savedSort = localStorage.getItem(SORT_KEY);
@@ -497,6 +584,10 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   setFilter(savedFilter && ['all', 'good', 'okay', 'bad', 'none'].includes(savedFilter) ? savedFilter : 'good');
   updateFlagCount();
+
+  document.querySelectorAll('.face-chip').forEach(chip => {
+    chip.addEventListener('click', () => toggleFaceChip(chip.dataset.identity));
+  });
 
   let resizeTimer = null;
   window.addEventListener('resize', () => {
@@ -559,6 +650,113 @@ VIDEO_BADGE_HTML = (
     '</div>'
 )
 
+UNKNOWN_CHIP_ID = "__unknown__"
+
+
+def _portrait_data_uri(portrait_path: Path) -> str | None:
+    """Return base64 data URI for portrait PNG, or None on failure."""
+    try:
+        data = portrait_path.read_bytes()
+    except Exception:
+        return None
+    return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+
+
+def _load_display_names(index_path: Path) -> dict[str, str]:
+    """Read data/identities/index.json -> {name: display_name}. Missing file/field is OK."""
+    if not index_path.exists():
+        return {}
+    try:
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to parse %s (%s); using raw identity names", index_path, e)
+        return {}
+    if not isinstance(data, list):
+        return {}
+    out: dict[str, str] = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str):
+            continue
+        display = entry.get("display_name")
+        out[name] = display if isinstance(display, str) and display else name
+    return out
+
+
+def _load_cluster_artifacts(clusters_path: Path) -> tuple[dict[str, set[str]], set[str], list[dict]]:
+    """Read clusters.json -> (frame_to_identities, frames_with_unknown, clusters_list)."""
+    if not clusters_path.exists():
+        return {}, set(), []
+    try:
+        data = json.loads(clusters_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to parse %s (%s); skipping face filter", clusters_path, e)
+        return {}, set(), []
+
+    frame_to_idents: dict[str, set[str]] = {}
+    clusters_list = data.get("clusters", []) if isinstance(data, dict) else []
+    for c in clusters_list:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("identity")
+        if not isinstance(name, str):
+            continue
+        for fid in c.get("frame_ids", []) or []:
+            if isinstance(fid, str):
+                frame_to_idents.setdefault(fid, set()).add(name)
+
+    frames_with_unknown: set[str] = {
+        fid for fid in (data.get("unknown_frame_ids", []) or [])
+        if isinstance(fid, str)
+    }
+    return frame_to_idents, frames_with_unknown, clusters_list
+
+
+def _build_face_chips_html(
+    clusters_list: list[dict],
+    frames_with_unknown: set[str],
+    display_names: dict[str, str],
+) -> str:
+    """Build the chip strip HTML. One chip per identity + an Unknown chip if applicable."""
+    chips: list[str] = []
+    # Sort by member_count desc so the dominant identities come first.
+    sorted_clusters = sorted(
+        (c for c in clusters_list if isinstance(c, dict) and isinstance(c.get("identity"), str)),
+        key=lambda c: int(c.get("member_count", 0) or 0),
+        reverse=True,
+    )
+    for c in sorted_clusters:
+        name = c["identity"]
+        label = display_names.get(name, name)
+        count = int(c.get("member_count", 0) or 0)
+        portrait = Path(f"data/identities/{name}.png")
+        data_uri = _portrait_data_uri(portrait)
+        if data_uri:
+            thumb = f'<img src="{data_uri}" alt="">'
+        else:
+            thumb = '<span class="face-chip-placeholder">?</span>'
+        chips.append(
+            f'<div class="face-chip" data-identity="{html.escape(name)}" '
+            f'title="{html.escape(label)} - {count} faces">'
+            f'{thumb}<span>{html.escape(label)} ({count})</span></div>'
+        )
+    if frames_with_unknown:
+        chips.append(
+            f'<div class="face-chip" data-identity="{UNKNOWN_CHIP_ID}" '
+            f'title="Frames with unclustered faces - {len(frames_with_unknown)} frames">'
+            f'<span class="face-chip-placeholder">?</span>'
+            f'<span>Unknown ({len(frames_with_unknown)})</span></div>'
+        )
+    if not chips:
+        return ""
+    return (
+        '<div class="face-filter"><span class="toolbar-label">Faces:</span>'
+        + "".join(chips)
+        + "</div>"
+    )
+
 
 def _build_card(
     row: pd.Series,
@@ -567,6 +765,8 @@ def _build_card(
     aspect: float,
     rotation: int,
     is_image_source: bool,
+    identities: list[str],
+    has_unknown: bool,
 ) -> str:
     pred_raw = row.get("pred_label")
     pred_label = (
@@ -594,6 +794,7 @@ def _build_card(
 
     source_type = "image" if is_image_source else "video"
     badge_html = "" if is_image_source else VIDEO_BADGE_HTML
+    identities_attr = "|".join(identities)
 
     return f"""<div class="photo-card"
      data-export-path="{html.escape(export_path)}"
@@ -605,6 +806,8 @@ def _build_card(
      data-aspect="{aspect:.4f}"
      data-rotation="{rotation}"
      data-video-stem="{html.escape(video_stem)}"
+     data-identities="{html.escape(identities_attr)}"
+     data-has-unknown="{'true' if has_unknown else 'false'}"
      data-flagged="false">
   <button class="flag-btn" title="Toggle flag (space in lightbox)">Flag</button>
   {badge_html}
@@ -639,6 +842,7 @@ def main() -> None:
         force=True,
     )
 
+    cfg: RunConfig | None = None
     if args.config is not None:
         cfg = RunConfig.from_yaml(args.config)
         if args.results is None:
@@ -652,6 +856,24 @@ def main() -> None:
 
     df = pd.read_parquet(args.results)
     logger.info("Loaded %d rows from %s", len(df), args.results)
+
+    # Run identity clustering before assembling the viewer so the face filter
+    # has fresh data. Failure must not block the viewer build.
+    clusters_path: Path | None = None
+    if cfg is not None:
+        clusters_path = cfg.output_dir / "clusters.json"
+        if "embedding" in df.columns:
+            try:
+                from still_extractor.build_clusters import run_clustering
+                run_clustering(cfg)
+            except Exception as e:
+                logger.warning("Identity clustering failed (%s); building viewer without face filter", e)
+        else:
+            logger.warning("No 'embedding' column in results.parquet; skipping clustering")
+
+    frame_to_identities, frames_with_unknown, clusters_list = (
+        _load_cluster_artifacts(clusters_path) if clusters_path else ({}, set(), [])
+    )
 
     face_h = df["face_y2"] - df["face_y1"]
     df["face_coverage"] = (
@@ -700,7 +922,15 @@ def main() -> None:
         else:
             aspect = 1.0
 
-        cards.append(_build_card(row, thumb_src, export_path, aspect, rotation, is_image_source))
+        stem_str = str(row.get("video_stem", "") or "")
+        ckey = card_key(stem_str, kept_p) if stem_str else None
+        identities = sorted(frame_to_identities.get(ckey, set())) if ckey else []
+        has_unknown = ckey in frames_with_unknown if ckey else False
+
+        cards.append(_build_card(
+            row, thumb_src, export_path, aspect, rotation, is_image_source,
+            identities, has_unknown,
+        ))
 
     if skipped:
         logger.info("Skipped %d rows (missing video_path or keeper)", skipped)
@@ -708,6 +938,9 @@ def main() -> None:
         "Built %d cards (%d image-source, %d video-source)",
         len(cards), image_source_count, len(cards) - image_source_count,
     )
+
+    display_names = _load_display_names(Path("data/identities/index.json"))
+    face_chips_html = _build_face_chips_html(clusters_list, frames_with_unknown, display_names)
 
     body = f"""<!doctype html>
 <html lang="en">
@@ -745,6 +978,7 @@ def main() -> None:
     <span class="toolbar-sep">|</span>
     <button id="export-btn">Export Flagged (0)</button>
   </div>
+  {face_chips_html}
   <div class="legend">
     Click image to open lightbox. In lightbox: <kbd>&larr;</kbd><kbd>&rarr;</kbd> navigate, <kbd>Space</kbd> flag, <kbd>Esc</kbd> close.
   </div>

@@ -39,7 +39,7 @@ from still_extractor.constants import (
     UPRIGHTER_INPUT_SIZE,
     UPRIGHTER_LABELS,
 )
-from still_extractor.face_crop import extract_face_crop_from_image
+from still_extractor.face_crop import extract_face_crop_from_image, is_keypoint_anomalous
 from still_extractor.models import Models
 from still_extractor.sampling import (
     _apply_rotation,
@@ -488,6 +488,7 @@ def _face_slot_columns(face, class_probs: np.ndarray | None, slot: int) -> dict:
             f"{prefix}y2": None,
             f"{prefix}det_score": None,
             f"{prefix}kps": None,
+            f"{prefix}kps_anomalous": None,
             f"{prefix}p_none": None,
             f"{prefix}p_bad": None,
             f"{prefix}p_okay": None,
@@ -508,13 +509,18 @@ def _face_slot_columns(face, class_probs: np.ndarray | None, slot: int) -> dict:
         idx = int(np.argmax(class_probs))
         pred_label = FACE_QUALITY_LABELS[idx]
         pred_confidence = float(class_probs[idx])
+    kps_list = [[float(x), float(y)] for x, y in face.kps]
+    anomalous, _ = is_keypoint_anomalous(
+        kps_list, (bbox[0], bbox[1], bbox[2], bbox[3]),
+    )
     return {
         f"{prefix}x1": int(bbox[0]),
         f"{prefix}y1": int(bbox[1]),
         f"{prefix}x2": int(bbox[2]),
         f"{prefix}y2": int(bbox[3]),
         f"{prefix}det_score": float(face.det_score),
-        f"{prefix}kps": json.dumps([[float(x), float(y)] for x, y in face.kps]),
+        f"{prefix}kps": json.dumps(kps_list),
+        f"{prefix}kps_anomalous": bool(anomalous),
         f"{prefix}p_none": p_none,
         f"{prefix}p_bad": p_bad,
         f"{prefix}p_okay": p_okay,

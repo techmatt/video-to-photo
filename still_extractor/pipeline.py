@@ -367,12 +367,19 @@ def main() -> None:
 
     pred_label_counts = {lbl: 0 for lbl in FACE_QUALITY_LABELS}
     uprighter_corrections = 0
+    kps_anomalous_count = 0
     for k in capped_survivors:
         lbl = k.get("pred_label") or ""
         if lbl in pred_label_counts:
             pred_label_counts[lbl] += 1
         if int(k.get("uprighter_pred", 0)) != 0:
             uprighter_corrections += 1
+        if k.get("face_1_kps_anomalous") is True:
+            kps_anomalous_count += 1
+    kps_anomalous_pct = (
+        100.0 * kps_anomalous_count / len(capped_survivors)
+        if capped_survivors else 0.0
+    )
 
     stage_times_block, stage_times_pct = _aggregate_stage_times(per_file_stage_times)
 
@@ -389,6 +396,8 @@ def main() -> None:
         "videos_capped": int(videos_capped),
         "pred_label_counts": pred_label_counts,
         "uprighter_corrections_applied": int(uprighter_corrections),
+        "kps_anomalous_count": int(kps_anomalous_count),
+        "kps_anomalous_pct": float(kps_anomalous_pct),
         "rejection_stats": rejection_stats,
         "stage_times_s": stage_times_block,
         "stage_times_pct": stage_times_pct,
@@ -403,6 +412,7 @@ def main() -> None:
     print(f"Keepers (post-cap):     {keepers_after_video_cap}")
     print(f"Videos capped:          {videos_capped}")
     print(f"Uprighter corrections:  {uprighter_corrections}")
+    print(f"Kps anomalous:          {kps_anomalous_count}  ({kps_anomalous_pct:.1f}%)")
     print(f"pred_label_counts:      {pred_label_counts}")
     print(
         f"Rejected faces:         total={rejection_stats['total_faces_rejected']} "
