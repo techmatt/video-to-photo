@@ -605,6 +605,11 @@ def main() -> None:
         help="Fraction of training 'none' count to add as synthetic non-face "
              "background crops sampled from --results keepers. 0 disables.",
     )
+    parser.add_argument(
+        "--sampler-boost-good", type=float, default=SAMPLER_BOOST["good"],
+        help=f"WeightedRandomSampler boost multiplier for the 'good' class "
+             f"(default: {SAMPLER_BOOST['good']})",
+    )
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -679,6 +684,7 @@ def main() -> None:
     train_ds = FaceCropDataset(train_items, train_transform)
     val_ds = FaceCropDataset(val_items, val_transform)
 
+    SAMPLER_BOOST["good"] = args.sampler_boost_good
     logger.info("Sampler boost: %s", SAMPLER_BOOST)
 
     def _rebuild_train_loader() -> DataLoader:

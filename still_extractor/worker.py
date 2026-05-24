@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import av
 import cv2
 import imagehash
 import numpy as np
@@ -66,11 +67,28 @@ EXIF_DATE_TAG_FALLBACK = 306     # DateTime
 EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"
 
 _VIDEO_EXIF_SKIP_SUFFIXES = frozenset({
-    ".mp4", ".mov", ".avi", ".mkv", ".m4v", ".heic", ".heif",
+    ".mp4", ".mov", ".avi", ".mkv", ".m4v",
+})
+_VIDEO_METADATA_SUFFIXES = frozenset({
+    ".mp4", ".mov", ".m4v", ".avi", ".mkv",
 })
 _PATH_YEAR_MONTH_RE = re.compile(r"(20\d{2})[-_./]?(0[1-9]|1[0-2])(?!\d)")
 _PATH_YYYYMMDD_RE = re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)")
 _PATH_YEAR_RE = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
+_PATH_MONTHNAME_YEAR_RE = re.compile(
+    r"(?i)(?<![a-z])"
+    r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+    r"nov(?:ember)?|dec(?:ember)?)"
+    r"(?![a-z])"
+    r"(?:[\s_.-]+[0-3]?\d)?"
+    r"[\s_.-]?"
+    r"(20\d{2})(?!\d)",
+)
+_MONTHNAME_TO_NUM: dict[str, int] = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
 
 def _parse_exif_year_month(raw: bytes | str | None) -> tuple[int, int] | None:
@@ -116,6 +134,12 @@ def _path_year_month(source_path: Path) -> tuple[int, int] | None:
     ym = _PATH_YEAR_MONTH_RE.search(text)
     if ym is not None:
         return int(ym.group(1)), int(ym.group(2))
+    mn = _PATH_MONTHNAME_YEAR_RE.search(text)
+    if mn is not None:
+        token = mn.group(1).lower()[:3]
+        month = _MONTHNAME_TO_NUM.get(token)
+        if month is not None:
+            return int(mn.group(2)), month
     y = _PATH_YEAR_RE.search(text)
     if y is not None:
         return int(y.group(1)), 0
@@ -131,11 +155,52 @@ def _mtime_year_month(source_path: Path) -> tuple[int, int] | None:
         return None
 
 
+def _parse_iso_year_month(raw: str) -> tuple[int, int] | None:
+    s = raw.strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.year >= 2000:
+            return dt.year, dt.month
+    except ValueError:
+        pass
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m is not None:
+        y, mo = int(m.group(1)), int(m.group(2))
+        if y >= 2000 and 1 <= mo <= 12:
+            return y, mo
+    return None
+
+
+def _video_metadata_year_month(source_path: Path) -> tuple[int, int] | None:
+    """Read capture date from video container metadata via PyAV.
+
+    Prefers Apple QuickTime's timezone-aware `com.apple.quicktime.creationdate`
+    over the generic `creation_time`. Returns None if metadata is missing,
+    unparseable, or the container can't be opened.
+    """
+    try:
+        with av.open(str(source_path)) as container:
+            meta = dict(container.metadata or {})
+    except Exception:
+        return None
+    for key in ("com.apple.quicktime.creationdate", "creation_time"):
+        raw = meta.get(key)
+        if not isinstance(raw, str) or not raw:
+            continue
+        parsed = _parse_iso_year_month(raw)
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def extract_source_date(source_path: Path) -> tuple[int, int, str]:
     """Return (year, month, date_source) for the source file.
 
-    Fallback chain: EXIF DateTimeOriginal -> EXIF DateTime -> path regex -> mtime -> unknown.
-    Skips EXIF for known video/HEIC extensions. Never raises.
+    Fallback chain: EXIF DateTimeOriginal -> EXIF DateTime -> video container
+    metadata (creation_time / com.apple.quicktime.creationdate) -> path regex
+    -> mtime -> unknown. Skips EXIF for known video extensions. Never raises.
     """
     try:
         suffix = source_path.suffix.lower()
@@ -147,6 +212,14 @@ def extract_source_date(source_path: Path) -> tuple[int, int, str]:
             if exif_result is not None:
                 (year, month), source = exif_result
                 return year, month, source
+
+        if suffix in _VIDEO_METADATA_SUFFIXES:
+            try:
+                vm_result = _video_metadata_year_month(source_path)
+            except Exception:
+                vm_result = None
+            if vm_result is not None:
+                return vm_result[0], vm_result[1], "video_metadata"
 
         try:
             path_ym = _path_year_month(source_path)
