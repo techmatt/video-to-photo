@@ -455,7 +455,7 @@ def _build_frame_json(
 
 VIDEO_BADGE_HTML = (
     '<div class="video-badge" title="Video source">'
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="14" height="14" '
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" '
     'fill="white" aria-hidden="true">'
     '<path d="M8 5v14l11-7z"/>'
     '</svg>'
@@ -1133,21 +1133,18 @@ body.selection-mode .card-check {
 /* Video badge */
 .video-badge {
   position: absolute;
-  top: 8px;
-  right: 8px;
-  width: 22px;
-  height: 22px;
-  background: rgba(0,0,0,0.55);
-  border-radius: 50%;
-  display: none;
+  top: 6px;
+  right: 6px;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
   pointer-events: none;
   z-index: 2;
   opacity: 0.85;
+  filter: drop-shadow(0 1px 2px rgba(0,0,0,0.55));
 }
-body.show-video-badge .photo-card[data-source-type="video"] .video-badge { display: inline-flex; }
-.photo-card[data-source-type="video"]:hover .video-badge { display: inline-flex; }
 #export-grid .video-badge { display: none !important; }
 
 /* ---------- Lightbox ---------- */
@@ -1456,12 +1453,11 @@ const KEY_SELECTED = 'se_selected';
 const KEY_YEARS_COLLAPSED = 'se_years_collapsed';        // legacy
 const KEY_SECTIONS_COLLAPSED = 'se_sections_collapsed';  // new
 const KEY_YEARS_EXPANDED = 'se_years_expanded';
-const KEY_LAYOUT = 'se_layout';
 const KEY_QUALITY_FILTER = 'se_quality_filter';
+const KEY_SOURCE_FILTER = 'se_source_filter';
 const KEY_PEOPLE_FILTER = 'se_people_filter';
 const KEY_SHOW_DEBUG = 'se_debug_show_debug';
 const KEY_SHOW_FACES = 'se_debug_show_faces';
-const KEY_SHOW_VIDEO_BADGE = 'se_debug_show_video_badge';
 const KEY_SHOW_REJECTED = 'se_debug_show_rejected';
 
 const UNKNOWN_CHIP_ID = '__unknown__';
@@ -1485,10 +1481,11 @@ const LABEL_COLORS = {
 let selected = new Set();
 let collapsedSections = new Set();
 let expandedYears = new Set();
-let layout = 'crop';
+let layout = 'justified';
 let qualityFilter = { good: true, okay: false, bad: false, none: false };
+let sourceFilter = 'all';
 let peopleFilter = { mode: 'AND', identities: [] };
-let debugFlags = { show_debug: false, show_faces: false, show_video_badge: false };
+let debugFlags = { show_debug: false, show_faces: false };
 let showRejected = false;
 
 let lightboxOrder = [];
@@ -1538,8 +1535,9 @@ function loadState() {
     if (Array.isArray(e)) expandedYears = new Set(e.map(x => parseInt(x, 10)).filter(n => !isNaN(n)));
   } catch (_) {}
 
-  const lay = localStorage.getItem(KEY_LAYOUT);
-  layout = (lay === 'justified') ? 'justified' : 'crop';
+  const sf = localStorage.getItem(KEY_SOURCE_FILTER);
+  if (sf === 'images' || sf === 'videos') sourceFilter = sf;
+  else sourceFilter = 'all';
 
   try {
     const q = JSON.parse(localStorage.getItem(KEY_QUALITY_FILTER) || 'null');
@@ -1559,20 +1557,18 @@ function loadState() {
   } catch (_) {}
   debugFlags.show_debug = localStorage.getItem(KEY_SHOW_DEBUG) === 'true';
   debugFlags.show_faces = localStorage.getItem(KEY_SHOW_FACES) === 'true';
-  debugFlags.show_video_badge = localStorage.getItem(KEY_SHOW_VIDEO_BADGE) === 'true';
   showRejected = localStorage.getItem(KEY_SHOW_REJECTED) === 'true';
 }
 
 function saveSelected() { localStorage.setItem(KEY_SELECTED, JSON.stringify(Array.from(selected))); }
 function saveCollapsedSections() { localStorage.setItem(KEY_SECTIONS_COLLAPSED, JSON.stringify(Array.from(collapsedSections))); }
 function saveExpandedYears() { localStorage.setItem(KEY_YEARS_EXPANDED, JSON.stringify(Array.from(expandedYears))); }
-function saveLayout() { localStorage.setItem(KEY_LAYOUT, layout); }
 function saveQualityFilter() { localStorage.setItem(KEY_QUALITY_FILTER, JSON.stringify(qualityFilter)); }
+function saveSourceFilter() { localStorage.setItem(KEY_SOURCE_FILTER, sourceFilter); }
 function savePeopleFilter() { localStorage.setItem(KEY_PEOPLE_FILTER, JSON.stringify(peopleFilter)); }
 function saveDebugFlags() {
   localStorage.setItem(KEY_SHOW_DEBUG, String(debugFlags.show_debug));
   localStorage.setItem(KEY_SHOW_FACES, String(debugFlags.show_faces));
-  localStorage.setItem(KEY_SHOW_VIDEO_BADGE, String(debugFlags.show_video_badge));
 }
 
 // === Card helpers ===
@@ -1597,7 +1593,15 @@ function passesPeople(card) {
   return peopleFilter.mode === 'AND' ? sels.every(has) : sels.some(has);
 }
 
-function passesFilter(card) { return passesQuality(card) && passesPeople(card); }
+function passesSource(card) {
+  if (sourceFilter === 'all') return true;
+  const t = card.dataset.sourceType;
+  if (sourceFilter === 'images') return t === 'image';
+  if (sourceFilter === 'videos') return t === 'video';
+  return true;
+}
+
+function passesFilter(card) { return passesQuality(card) && passesPeople(card) && passesSource(card); }
 
 // === Apply filters & counts ===
 function applyFilters() {
@@ -1625,15 +1629,10 @@ function applyFilters() {
   scheduleJustifiedRelayout();
 }
 
-// === Layout (crop vs justified) ===
+// === Layout (justified only; crop CSS retained as dead code) ===
 function applyLayout() {
-  document.body.classList.toggle('layout-crop', layout === 'crop');
-  document.body.classList.toggle('layout-justified', layout === 'justified');
-  if (layout === 'justified') {
-    layoutAllVisibleJustified();
-  } else {
-    unwrapAllJustifiedRows();
-  }
+  document.body.classList.add('layout-justified');
+  layoutAllVisibleJustified();
 }
 
 function unwrapAllJustifiedRows() {
@@ -1903,8 +1902,7 @@ function toggleDropdown(name) {
 
 // === Settings / debug ===
 function applyDebugFlags() {
-  document.body.classList.toggle('show-video-badge', debugFlags.show_video_badge);
-  ['show_debug', 'show_faces', 'show_video_badge'].forEach(k => {
+  ['show_debug', 'show_faces'].forEach(k => {
     const cb = document.getElementById('toggle-' + k);
     if (cb) cb.checked = !!debugFlags[k];
   });
@@ -2568,7 +2566,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Settings checkboxes
-  ['show_debug', 'show_faces', 'show_video_badge'].forEach(k => {
+  ['show_debug', 'show_faces'].forEach(k => {
     const cb = document.getElementById('toggle-' + k);
     if (!cb) return;
     cb.checked = !!debugFlags[k];
@@ -2582,14 +2580,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
   applyDebugFlags();
 
-  // Layout radios
-  document.querySelectorAll('input[name="layout-radio"]').forEach(r => {
-    r.checked = (r.value === layout);
+  // Source radios
+  document.querySelectorAll('input[name="source-radio"]').forEach(r => {
+    r.checked = (r.value === sourceFilter);
     r.addEventListener('change', () => {
       if (!r.checked) return;
-      layout = (r.value === 'justified') ? 'justified' : 'crop';
-      saveLayout();
-      applyLayout();
+      sourceFilter = r.value;
+      saveSourceFilter();
+      applyFilters();
     });
   });
 
@@ -2848,7 +2846,9 @@ def main() -> None:
     )
     dims_cache_original_size = len(dims_cache)
 
-    cards_by_section: dict[tuple[int, int], list[str]] = {}
+    # Per section: list of (video_stem, sort_timestamp_s, card_html). Sorted after the
+    # loop so frames from the same source file appear together in temporal order.
+    cards_by_section: dict[tuple[int, int], list[tuple[str, float, str]]] = {}
     frames: list[dict] = []
     skipped = 0
     image_source_count = 0
@@ -2911,10 +2911,26 @@ def main() -> None:
             row, thumb_src, export_path, rotation, is_image_source,
             frame_idx, year, month, ckey, identities, has_unknown,
         )
-        cards_by_section.setdefault((year, month), []).append(card_html)
+        ts_val = row.get("timestamp_s")
+        if is_image_source or pd.isna(ts_val):
+            sort_ts = 0.0
+        else:
+            sort_ts = float(ts_val)
+        cards_by_section.setdefault((year, month), []).append((stem_str, sort_ts, card_html))
 
     if skipped:
         logger.info("Skipped %d rows (missing video_path or keeper)", skipped)
+
+    # Sort within each (year, month) section so frames from the same source file
+    # are grouped together. Ordering between groups uses the group's earliest
+    # timestamp; within a group, ascending timestamp.
+    for items in cards_by_section.values():
+        group_first_ts: dict[str, float] = {}
+        for stem, ts, _ in items:
+            prev = group_first_ts.get(stem)
+            if prev is None or ts < prev:
+                group_first_ts[stem] = ts
+        items.sort(key=lambda it: (group_first_ts[it[0]], it[0], it[1]))
 
     if cache_path is not None and len(dims_cache) != dims_cache_original_size:
         _save_frame_dimensions_cache(cache_path, dims_cache)
@@ -2965,7 +2981,7 @@ def main() -> None:
         y, m = ym
         sec = _section_key(y, m)
         label = _section_label(y, m)
-        section_cards = "\n".join(cards_by_section[ym])
+        section_cards = "\n".join(html_part for _, _, html_part in cards_by_section[ym])
         year_sections.append(f"""<section class="year-section" data-section="{sec}" data-year="{y}" data-month="{m}">
   <h2 class="year-header">
     <span class="year-arrow">&#9662;</span>
@@ -2996,13 +3012,14 @@ def main() -> None:
         .replace("__IDENTITY_PORTRAITS__", portraits_json)
     )
 
-    layout_panel = """
-<div class="dropdown-panel" id="dropdown-layout">
+    source_panel = """
+<div class="dropdown-panel" id="dropdown-source">
   <div class="dropdown-section">
-    <span class="dropdown-label">Layout</span>
+    <span class="dropdown-label">Source</span>
     <div class="layout-radios">
-      <label class="layout-radio"><input type="radio" name="layout-radio" value="crop"><span class="layout-name">Crop</span><span class="layout-hint">square grid</span></label>
-      <label class="layout-radio"><input type="radio" name="layout-radio" value="justified"><span class="layout-name">Justified</span><span class="layout-hint">full aspect</span></label>
+      <label class="layout-radio"><input type="radio" name="source-radio" value="all"><span class="layout-name">All</span></label>
+      <label class="layout-radio"><input type="radio" name="source-radio" value="images"><span class="layout-name">Images only</span></label>
+      <label class="layout-radio"><input type="radio" name="source-radio" value="videos"><span class="layout-name">Videos only</span></label>
     </div>
   </div>
 </div>"""
@@ -3041,7 +3058,6 @@ def main() -> None:
     <span class="dropdown-label">Debug</span>
     <label class="settings-toggle"><input type="checkbox" id="toggle-show_debug"><span class="toggle-label">Show debug scores</span><span class="toggle-hint">side panel</span></label>
     <label class="settings-toggle"><input type="checkbox" id="toggle-show_faces"><span class="toggle-label">Show face overlays</span><span class="toggle-hint">bboxes + kps</span></label>
-    <label class="settings-toggle"><input type="checkbox" id="toggle-show_video_badge"><span class="toggle-label">Always show video badge</span><span class="toggle-hint"></span></label>
   </div>
 </div>"""
 
@@ -3063,14 +3079,14 @@ def main() -> None:
     <span class="title">Still Extractor</span>
     <div class="year-pills">{year_pills_html}</div>
     <div class="header-controls">
-      <button class="dropdown-trigger" data-dropdown="layout">Layout <span class="caret">&#9662;</span></button>
+      <button class="dropdown-trigger" data-dropdown="source">Source <span class="caret">&#9662;</span></button>
       <button class="dropdown-trigger" data-dropdown="quality">Quality <span class="caret">&#9662;</span></button>
       {people_trigger}
       <button class="dropdown-trigger icon-only" data-dropdown="settings" title="Settings">&#9881;</button>
     </div>
     <button id="export-btn">Export (0)</button>
   </div>
-  {layout_panel}
+  {source_panel}
   {quality_panel}
   {people_panel}
   {settings_panel}
