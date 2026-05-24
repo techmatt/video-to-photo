@@ -9,8 +9,10 @@ so a single bad file never aborts a run.
 import json
 import logging
 import math
+import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,7 @@ import cv2
 import imagehash
 import numpy as np
 import pandas as pd
+import piexif
 import pillow_heif
 import torch
 import torch.nn.functional as F
@@ -57,6 +60,110 @@ logger = logging.getLogger(__name__)
 
 FACE_QUALITY_TTA_PASSES = 3
 AESTHETICS_BATCH_SIZE = 16
+
+EXIF_DATE_TAG_PRIMARY = 36867    # DateTimeOriginal
+EXIF_DATE_TAG_FALLBACK = 306     # DateTime
+EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"
+
+_VIDEO_EXIF_SKIP_SUFFIXES = frozenset({
+    ".mp4", ".mov", ".avi", ".mkv", ".m4v", ".heic", ".heif",
+})
+_PATH_YEAR_MONTH_RE = re.compile(r"(20\d{2})[-_./]?(0[1-9]|1[0-2])(?!\d)")
+_PATH_YYYYMMDD_RE = re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)")
+_PATH_YEAR_RE = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
+
+
+def _parse_exif_year_month(raw: bytes | str | None) -> tuple[int, int] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("ascii", errors="ignore")
+        except Exception:
+            return None
+    raw = raw.strip().rstrip("\x00")
+    if not raw:
+        return None
+    try:
+        dt = datetime.strptime(raw, EXIF_DATE_FORMAT)
+    except ValueError:
+        return None
+    return dt.year, dt.month
+
+
+def _exif_year_month(source_path: Path) -> tuple[tuple[int, int], str] | None:
+    """Return ((year, month), 'exif_primary'|'exif_fallback') if EXIF date is available."""
+    try:
+        exif = piexif.load(str(source_path))
+    except Exception:
+        return None
+    exif_ifd = exif.get("Exif", {}) or {}
+    primary = _parse_exif_year_month(exif_ifd.get(EXIF_DATE_TAG_PRIMARY))
+    if primary is not None:
+        return primary, "exif_primary"
+    zeroth = exif.get("0th", {}) or {}
+    fallback = _parse_exif_year_month(zeroth.get(EXIF_DATE_TAG_FALLBACK))
+    if fallback is not None:
+        return fallback, "exif_fallback"
+    return None
+
+
+def _path_year_month(source_path: Path) -> tuple[int, int] | None:
+    text = str(source_path)
+    ymd = _PATH_YYYYMMDD_RE.search(text)
+    if ymd is not None:
+        return int(ymd.group(1)), int(ymd.group(2))
+    ym = _PATH_YEAR_MONTH_RE.search(text)
+    if ym is not None:
+        return int(ym.group(1)), int(ym.group(2))
+    y = _PATH_YEAR_RE.search(text)
+    if y is not None:
+        return int(y.group(1)), 0
+    return None
+
+
+def _mtime_year_month(source_path: Path) -> tuple[int, int] | None:
+    try:
+        mtime = source_path.stat().st_mtime
+        dt = datetime.fromtimestamp(mtime)
+        return dt.year, dt.month
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+def extract_source_date(source_path: Path) -> tuple[int, int, str]:
+    """Return (year, month, date_source) for the source file.
+
+    Fallback chain: EXIF DateTimeOriginal -> EXIF DateTime -> path regex -> mtime -> unknown.
+    Skips EXIF for known video/HEIC extensions. Never raises.
+    """
+    try:
+        suffix = source_path.suffix.lower()
+        if suffix not in _VIDEO_EXIF_SKIP_SUFFIXES:
+            try:
+                exif_result = _exif_year_month(source_path)
+            except Exception:
+                exif_result = None
+            if exif_result is not None:
+                (year, month), source = exif_result
+                return year, month, source
+
+        try:
+            path_ym = _path_year_month(source_path)
+        except Exception:
+            path_ym = None
+        if path_ym is not None:
+            return path_ym[0], path_ym[1], "path_regex"
+
+        try:
+            mtime_ym = _mtime_year_month(source_path)
+        except Exception:
+            mtime_ym = None
+        if mtime_ym is not None:
+            return mtime_ym[0], mtime_ym[1], "mtime"
+    except Exception:
+        pass
+    return 0, 0, "unknown"
 
 # Per-stage timing keys. `total` is the outermost wall time and not part of the
 # per-stage breakdown. Aesthetics is included even though the prompt did not
@@ -553,6 +660,9 @@ def _build_keeper_dict(
     kept_path: Path,
     source_fps: float | None,
     file_size_bytes: int,
+    source_year: int,
+    source_month: int,
+    date_source: str,
     rejected_columns: dict,
 ) -> dict:
     h, w = bgr.shape[:2]
@@ -637,6 +747,9 @@ def _build_keeper_dict(
         "best_pair_score": best_pair_score,
         "source_fps": source_fps,
         "file_size_bytes": int(file_size_bytes),
+        "source_year": int(source_year),
+        "source_month": int(source_month),
+        "date_source": str(date_source),
         **rejected_columns,
     }
     return out
@@ -682,6 +795,7 @@ def _process_image(
 ) -> list[dict]:
     image_path = Path(row["file_path"])
     file_size_bytes = int(image_path.stat().st_size)
+    source_year, source_month, date_source = extract_source_date(image_path)
     with timer("frame_sampling"):
         try:
             with Image.open(image_path) as raw:
@@ -797,6 +911,9 @@ def _process_image(
         kept_path=kept_path,
         source_fps=None,
         file_size_bytes=file_size_bytes,
+        source_year=source_year,
+        source_month=source_month,
+        date_source=date_source,
         rejected_columns=rejected_columns,
     )]
 
@@ -855,6 +972,7 @@ def _process_video(
 ) -> list[dict]:
     video_path = Path(row["file_path"])
     file_size_bytes = int(video_path.stat().st_size)
+    source_year, source_month, date_source = extract_source_date(video_path)
     source_fps = get_video_fps(video_path)
     with timer("frame_sampling"):
         rotation = get_video_rotation(video_path)
@@ -1072,6 +1190,9 @@ def _process_video(
             kept_path=kept_path,
             source_fps=source_fps,
             file_size_bytes=file_size_bytes,
+            source_year=source_year,
+            source_month=source_month,
+            date_source=date_source,
             rejected_columns=_build_rejected_columns(c.rejected_faces),
         ))
     return out

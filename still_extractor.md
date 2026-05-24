@@ -40,9 +40,8 @@ EXIF orient → uprighter → sharpness gate → face detect → **rejection heu
 | `face_crop.py` | `extract_face_crop_from_image()` (in-memory), `extract_face_crop()` (path-based wrapper) |
 | `constants.py` | All shared constants + `card_key(video_stem, kept_path)` |
 | `utils.py` | `safe_float`, `to_fwd_slash`, `parse_kps` |
-| `build_photo_viewer.py` | Full-frame justified-grid viewer with flagging |
+| `build_photo_viewer.py` | Google Photos-style viewer with year sections, selection/export workflow, and toggleable debug overlay (face bbox + keypoints + score breakdown) |
 | `build_faces_review.py` | Face-crop labeling UI — filters out null-face rows automatically |
-| `build_debug_viewer.py` | Debug overlay viewer: face bbox + keypoints + score breakdown per frame |
 | `train_classifier.py` | Face quality classifier training (MobileNetV3) |
 | `train_uprighter.py` | Uprighter training (MobileNetV3, 4-class rotation) |
 | `build_uprighter_review.py` | Uprighter training data review HTML |
@@ -96,7 +95,6 @@ uv run python -m still_extractor.pipeline --config configs/june27.yaml --max-vid
 # Build viewers
 uv run python -m still_extractor.build_photo_viewer --config configs/june27.yaml
 uv run python -m still_extractor.build_faces_review --config configs/june27.yaml
-uv run python -m still_extractor.build_debug_viewer --config configs/june27.yaml
 
 # Start face export server (keep running while labeling)
 uv run python -m still_extractor.launch_faces_export_server --config configs/june27.yaml
@@ -140,8 +138,7 @@ uv run python -m still_extractor.train_uprighter \
 | `rejected/` | Face crop JPEGs rejected by heuristics: `{reason}_{stem}_{timestamp_s:.3f}_{face_idx}.jpg` |
 | `faces_review.html` | Face-crop labeling UI (null-face rows filtered out) |
 | `face_labels.json` | Labels exported from faces_review.html (input to export server) |
-| `index_photos.html` | Full-frame photo viewer with flagging |
-| `index_photos_debug.html` | Debug viewer: fullscreen overlay with bbox, keypoints, score breakdown |
+| `index_photos.html` | Google Photos-style viewer with year sections, selection/export, and toggleable debug overlay (scores + face bboxes/kps); replaces the prior `index_photos_debug.html` |
 
 ### Global (persistent across runs)
 
@@ -196,7 +193,7 @@ Applied before classifier inference. Controlled by constants in `constants.py`.
 - **too_small**: face area / frame area < `FACE_MIN_AREA_FRAC` (0.004)
 - **small_and_edge**: face area / frame area < `FACE_EDGE_IMMUNE_AREA_FRAC` (0.025) AND face center within `FACE_EDGE_ZONE_FRAC` (10%) of any frame edge
 
-Rejected face crops are written to `data/{run_name}/rejected/` for audit. The debug viewer shows rejected faces as dashed red boxes with a "Show Rejected" toggle.
+Rejected face crops are written to `data/{run_name}/rejected/` for audit. With the **Show face overlays** debug toggle enabled in `index_photos.html`, rejected faces appear as dashed red boxes in the lightbox; the per-frame side panel exposes a **Show Rejected** toggle.
 
 ---
 

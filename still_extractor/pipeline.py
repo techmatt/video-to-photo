@@ -358,6 +358,20 @@ def main() -> None:
     summary_path = output_dir / (
         "pipeline_summary_test.json" if test_mode else "pipeline_summary.json"
     )
+    # date_source is tracked per keeper for the summary breakdown but not stored
+    # in parquet — old parquets won't have it on reload anyway.
+    date_source_counts: dict[str, int] = {
+        "exif_primary": 0,
+        "exif_fallback": 0,
+        "path_regex": 0,
+        "mtime": 0,
+        "unknown": 0,
+    }
+    for k in capped_survivors:
+        ds = k.pop("date_source", None)
+        if isinstance(ds, str) and ds in date_source_counts:
+            date_source_counts[ds] += 1
+
     if capped_survivors:
         results_df = pd.DataFrame(capped_survivors)
         results_df.to_parquet(parquet_out, index=False)
@@ -399,6 +413,7 @@ def main() -> None:
         "kps_anomalous_count": int(kps_anomalous_count),
         "kps_anomalous_pct": float(kps_anomalous_pct),
         "rejection_stats": rejection_stats,
+        "date_source_counts": date_source_counts,
         "stage_times_s": stage_times_block,
         "stage_times_pct": stage_times_pct,
     }
@@ -419,6 +434,10 @@ def main() -> None:
         f"too_small={rejection_stats['too_small']} "
         f"small_and_edge={rejection_stats['small_and_edge']} "
         f"frames_all_rejected={rejection_stats['frames_with_all_faces_rejected']}"
+    )
+    print(
+        "Date sources:           "
+        + "  ".join(f"{k}={v}" for k, v in date_source_counts.items())
     )
     print("───────────────────────────────────────")
     _print_stage_timing_table(stage_times_block, stage_times_pct)

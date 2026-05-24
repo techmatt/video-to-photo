@@ -3,7 +3,7 @@
 from pathlib import Path
 
 IMAGE_EXTENSIONS: frozenset[str] = frozenset({
-    ".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".bmp",
+    ".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".bmp", ".webp",
 })
 VIDEO_EXTENSIONS: frozenset[str] = frozenset({
     ".mp4", ".mov", ".avi", ".mkv", ".m4v",
