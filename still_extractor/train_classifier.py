@@ -26,7 +26,7 @@ import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as T
 from PIL import Image
-from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, precision_score
 from sklearn.model_selection import StratifiedShuffleSplit
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
@@ -456,7 +456,7 @@ def train_one_epoch(
 def evaluate(
     model: nn.Module, loader: DataLoader, device: torch.device,
     criterion: nn.Module,
-) -> tuple[float, float, list[float], list[float]]:
+) -> tuple[float, float, list[float], list[float], list[float]]:
     model.eval()
     total_loss = 0.0
     n_seen = 0
@@ -483,10 +483,13 @@ def evaluate(
         per_class_acc.append(
             float((y_pred[mask] == c).sum()) / n if n > 0 else float("nan"),
         )
-    _, _, f1, _ = precision_recall_fscore_support(
+    prec, _, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=list(range(N_CLASSES)), zero_division=0,
     )
-    return val_loss, val_acc, per_class_acc, [float(v) for v in f1]
+    return (
+        val_loss, val_acc, per_class_acc,
+        [float(v) for v in f1], [float(v) for v in prec],
+    )
 
 
 @torch.no_grad()
@@ -610,6 +613,12 @@ def main() -> None:
         help=f"WeightedRandomSampler boost multiplier for the 'good' class "
              f"(default: {SAMPLER_BOOST['good']})",
     )
+    parser.add_argument(
+        "--select-by", default="val_loss", choices=["val_loss", "p_good"],
+        help="Metric used to pick the best checkpoint and drive early-stop "
+             "patience. 'val_loss' minimizes loss (default); 'p_good' "
+             "maximizes Good precision.",
+    )
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -718,16 +727,25 @@ def main() -> None:
 
     phase1_end = args.epochs // 2
     phase2_start = phase1_end + 1
-    best_val_loss = float("inf")
+    select_maximize = args.select_by == "p_good"
+    best_score = float("-inf") if select_maximize else float("inf")
     best_epoch = 0
     best_path = args.output if args.output is not None else args.output_dir / "best_model.pt"
     best_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Best checkpoint will be saved to %s", best_path)
+    logger.info(
+        "Best checkpoint will be saved to %s (selecting by %s, %s)",
+        best_path, args.select_by,
+        "maximize" if select_maximize else "minimize",
+    )
     log_rows: list[dict] = []
+
+    def _is_better(new: float, ref: float) -> bool:
+        return new > ref if select_maximize else new < ref
 
     header = (
         f"{'epoch':>5} {'ph':>2} {'lr':>9} "
-        f"{'tr_loss':>9} {'val_loss':>9} {'val_acc':>8} {'f1_good':>8} "
+        f"{'tr_loss':>9} {'val_loss':>9} {'val_acc':>8} "
+        f"{'p_good':>8} {'f1_good':>8} "
         f"| per-class acc (n/b/o/g)"
     )
     print(header)
@@ -748,9 +766,9 @@ def main() -> None:
             "Epoch %d: resampled %d synthetic none crops", epoch, len(crops),
         )
 
-    def _run_epoch(epoch: int, phase: int) -> tuple[float, float]:
+    def _run_epoch(epoch: int, phase: int) -> tuple[float, float, float]:
         tr_loss = train_one_epoch(model, train_loader, optimizer, device)
-        val_loss, val_acc, per_class_acc, per_class_f1 = evaluate(
+        val_loss, val_acc, per_class_acc, per_class_f1, per_class_prec = evaluate(
             model, val_loader, device, val_criterion,
         )
         scheduler.step()
@@ -760,10 +778,13 @@ def main() -> None:
             for c in range(N_CLASSES)
         )
         good_f1 = per_class_f1[good_idx]
-        marker = "  [best]" if phase == 2 and val_loss < best_val_loss else ""
+        good_prec = per_class_prec[good_idx]
+        cur_score = good_prec if select_maximize else val_loss
+        marker = "  [best]" if phase == 2 and _is_better(cur_score, best_score) else ""
         print(
             f"{epoch:>5d} {phase:>2d} {cur_lr:>9.2e} "
-            f"{tr_loss:>9.4f} {val_loss:>9.4f} {val_acc:>8.3f} {good_f1:>8.3f} "
+            f"{tr_loss:>9.4f} {val_loss:>9.4f} {val_acc:>8.3f} "
+            f"{good_prec:>8.3f} {good_f1:>8.3f} "
             f"| {pc_str}{marker}",
             flush=True,
         )
@@ -774,11 +795,13 @@ def main() -> None:
             "train_loss": tr_loss,
             "val_loss": val_loss,
             "val_acc": val_acc,
+            "p_good": good_prec,
             "f1_good": good_f1,
             **{f"acc_{IDX_TO_LABEL[c]}": per_class_acc[c] for c in range(N_CLASSES)},
             **{f"f1_{IDX_TO_LABEL[c]}": per_class_f1[c] for c in range(N_CLASSES)},
+            **{f"p_{IDX_TO_LABEL[c]}": per_class_prec[c] for c in range(N_CLASSES)},
         })
-        return tr_loss, val_loss
+        return tr_loss, val_loss, good_prec
 
     logger.info("=== Phase 1: training head only (epochs 1-%d) ===", phase1_end)
     for epoch in range(1, phase1_end + 1):
@@ -793,19 +816,21 @@ def main() -> None:
     optimizer, scheduler = _make_optimizer(
         model, args.lr, args.epochs, start_epoch=phase1_end,
     )
-    best_val_loss = float("inf")
+    best_score = float("-inf") if select_maximize else float("inf")
     best_epoch = 0
     patience_left = args.patience
 
     for epoch in range(phase2_start, args.epochs + 1):
         _resample_synth(epoch)
-        _, val_loss = _run_epoch(epoch, phase=2)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        _, val_loss, good_prec = _run_epoch(epoch, phase=2)
+        cur_score = good_prec if select_maximize else val_loss
+        if _is_better(cur_score, best_score):
+            best_score = cur_score
             best_epoch = epoch
             torch.save(
                 {"model_state": model.state_dict(), "epoch": epoch,
-                 "val_loss": val_loss},
+                 "val_loss": val_loss, "p_good": good_prec,
+                 "select_by": args.select_by},
                 best_path,
             )
             patience_left = args.patience
@@ -813,15 +838,15 @@ def main() -> None:
             patience_left -= 1
             if patience_left <= 0:
                 logger.info(
-                    "Early stop at epoch %d (best val_loss=%.4f @ epoch %d)",
-                    epoch, best_val_loss, best_epoch,
+                    "Early stop at epoch %d (best %s=%.4f @ epoch %d)",
+                    epoch, args.select_by, best_score, best_epoch,
                 )
                 break
 
     pd.DataFrame(log_rows).to_csv(args.output_dir / "training_log.csv", index=False)
     logger.info(
-        "Wrote training_log.csv (%d epochs, best val_loss=%.4f @ epoch %d)",
-        len(log_rows), best_val_loss, best_epoch,
+        "Wrote training_log.csv (%d epochs, best %s=%.4f @ epoch %d)",
+        len(log_rows), args.select_by, best_score, best_epoch,
     )
 
     state = torch.load(best_path, map_location=device, weights_only=False)
@@ -830,9 +855,13 @@ def main() -> None:
 
     y_true, y_pred = _collect_predictions(model, val_loader, device)
     _print_validation_report(y_true, y_pred)
+    p_good_str = (
+        f", p_good={float(state['p_good']):.4f}" if "p_good" in state else ""
+    )
     print(
         f"\nBest checkpoint: epoch {state['epoch']}, "
-        f"val_loss={float(state['val_loss']):.4f}",
+        f"val_loss={float(state['val_loss']):.4f}{p_good_str} "
+        f"(selected by {args.select_by})",
     )
 
     if args.results is None:
