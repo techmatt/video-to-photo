@@ -19,7 +19,7 @@ DEFAULT_FACE_QUALITY_MODEL: Path = Path("models/face_quality/best_model.pt")
 # p_good descending. face_1 is mirrored into the legacy face_* columns
 # (face_x1, p_good, pred_label, etc.) — downstream code still reads those.
 FACE_SLOT_COLUMNS: list[str] = [
-    "x1", "y1", "x2", "y2", "det_score", "kps",
+    "x1", "y1", "x2", "y2", "det_score", "kps", "embedding",
     "p_none", "p_bad", "p_okay", "p_good", "pred_label", "pred_confidence",
 ]
 FACE_SLOTS: list[int] = [1, 2, 3]

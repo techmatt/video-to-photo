@@ -662,8 +662,11 @@ def _portrait_data_uri(portrait_path: Path) -> str | None:
     return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
 
 
-def _load_display_names(index_path: Path) -> dict[str, str]:
-    """Read data/identities/index.json -> {name: display_name}. Missing file/field is OK."""
+def _load_identity_index(index_path: Path) -> dict[str, dict]:
+    """Read data/identities/index.json -> {name: {display_name, portrait_path}}.
+
+    Missing file/field is OK; falls back to name and data/identities/{name}.png.
+    """
     if not index_path.exists():
         return {}
     try:
@@ -673,7 +676,7 @@ def _load_display_names(index_path: Path) -> dict[str, str]:
         return {}
     if not isinstance(data, list):
         return {}
-    out: dict[str, str] = {}
+    out: dict[str, dict] = {}
     for entry in data:
         if not isinstance(entry, dict):
             continue
@@ -681,7 +684,14 @@ def _load_display_names(index_path: Path) -> dict[str, str]:
         if not isinstance(name, str):
             continue
         display = entry.get("display_name")
-        out[name] = display if isinstance(display, str) and display else name
+        portrait = entry.get("portrait_path")
+        out[name] = {
+            "display_name": display if isinstance(display, str) and display else name,
+            "portrait_path": (
+                portrait if isinstance(portrait, str) and portrait
+                else f"data/identities/{name}.png"
+            ),
+        }
     return out
 
 
@@ -717,7 +727,7 @@ def _load_cluster_artifacts(clusters_path: Path) -> tuple[dict[str, set[str]], s
 def _build_face_chips_html(
     clusters_list: list[dict],
     frames_with_unknown: set[str],
-    display_names: dict[str, str],
+    identity_index: dict[str, dict],
 ) -> str:
     """Build the chip strip HTML. One chip per identity + an Unknown chip if applicable."""
     chips: list[str] = []
@@ -729,9 +739,10 @@ def _build_face_chips_html(
     )
     for c in sorted_clusters:
         name = c["identity"]
-        label = display_names.get(name, name)
+        info = identity_index.get(name, {})
+        label = info.get("display_name", name)
         count = int(c.get("member_count", 0) or 0)
-        portrait = Path(f"data/identities/{name}.png")
+        portrait = Path(info.get("portrait_path", f"data/identities/{name}.png"))
         data_uri = _portrait_data_uri(portrait)
         if data_uri:
             thumb = f'<img src="{data_uri}" alt="">'
@@ -939,8 +950,8 @@ def main() -> None:
         len(cards), image_source_count, len(cards) - image_source_count,
     )
 
-    display_names = _load_display_names(Path("data/identities/index.json"))
-    face_chips_html = _build_face_chips_html(clusters_list, frames_with_unknown, display_names)
+    identity_index = _load_identity_index(Path("data/identities/index.json"))
+    face_chips_html = _build_face_chips_html(clusters_list, frames_with_unknown, identity_index)
 
     body = f"""<!doctype html>
 <html lang="en">

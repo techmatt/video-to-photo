@@ -9,6 +9,7 @@ index.json + renaming the matching PNG.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import sys
@@ -32,6 +33,9 @@ logger = logging.getLogger(__name__)
 DBSCAN_EPS = 0.4
 DBSCAN_MIN_SAMPLES = 5  # minimum cluster size
 IDENTITY_MATCH_THRESHOLD = 0.5  # max cosine distance to match existing identity
+# Orphan recovery is more lenient: the user explicitly opted in by renaming
+# the PNG, so we trust borderline matches more than blind centroid matching.
+ORPHAN_MATCH_THRESHOLD = 0.6
 
 PORTRAIT_SIZE = 256
 
@@ -95,18 +99,31 @@ def _load_identity_index(index_path: Path) -> list[dict]:
     return data
 
 
+def _sha256_file(path: Path) -> str | None:
+    """Return hex sha256 of file contents, or None on read failure."""
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError as e:
+        logger.warning("Failed to hash %s: %s", path, e)
+        return None
+
+
 def _save_portrait(
     kept_path: Path,
     bbox: tuple[float, float, float, float],
     kps,
     out_path: Path,
-) -> bool:
-    """Crop the representative face, resize to PORTRAIT_SIZE, write PNG. Return success."""
+) -> str | None:
+    """Crop the representative face, resize, write PNG. Return sha256 or None on failure."""
     try:
         img = Image.open(kept_path).convert("RGB")
     except Exception as e:
         logger.warning("Failed to open %s for portrait: %s", kept_path, e)
-        return False
+        return None
     x1, y1, x2, y2 = bbox
     try:
         crop = extract_face_crop_from_image(
@@ -117,8 +134,204 @@ def _save_portrait(
         crop.save(out_path, format="PNG")
     except Exception as e:
         logger.warning("Failed to write portrait %s: %s", out_path, e)
-        return False
-    return True
+        return None
+    return _sha256_file(out_path)
+
+
+def _sync_identity_names(identities_dir: Path, existing: list[dict]) -> None:
+    """Reflect portrait-file renames into `existing` entries (in place).
+
+    For each PNG under `identities_dir`, try to link it to an entry by:
+      1. matching the stored `portrait_sha256` (strong link), else
+      2. matching the filename stem against the entry's `display_name` or `name`.
+
+    On match, updates the entry's `display_name` (file stem), `portrait_path`
+    (the actual file, project-relative), and refreshes `portrait_sha256`.
+
+    Unmatched PNGs are logged as orphans. Each entry can be claimed by at most
+    one PNG; later candidates for an already-claimed entry are skipped.
+    """
+    if not identities_dir.exists():
+        return
+    pngs = sorted(identities_dir.glob("*.png"))
+    if not pngs:
+        return
+
+    by_hash: dict[str, dict] = {}
+    by_name: dict[str, dict] = {}
+    by_display: dict[str, dict] = {}
+    for entry in existing:
+        h = entry.get("portrait_sha256")
+        if isinstance(h, str) and h:
+            by_hash.setdefault(h, entry)
+        n = entry.get("name")
+        if isinstance(n, str) and n:
+            by_name.setdefault(n, entry)
+        d = entry.get("display_name")
+        if isinstance(d, str) and d:
+            by_display.setdefault(d, entry)
+
+    claimed: set[int] = set()
+    for png in pngs:
+        h = _sha256_file(png)
+        entry = None
+        match_type = None
+        if h is not None and h in by_hash:
+            entry = by_hash[h]
+            match_type = "hash"
+        elif png.stem in by_display:
+            entry = by_display[png.stem]
+            match_type = "stem(display)"
+        elif png.stem in by_name:
+            entry = by_name[png.stem]
+            match_type = "stem(name)"
+
+        if entry is None:
+            logger.info("Orphan portrait (no hash or stem match): %s", png)
+            continue
+        if id(entry) in claimed:
+            logger.warning(
+                "Portrait %s would re-link identity %s via %s, but it is "
+                "already claimed by another file; ignoring.",
+                png, entry.get("name"), match_type,
+            )
+            continue
+        claimed.add(id(entry))
+
+        new_display = png.stem
+        new_path = f"data/identities/{png.name}"
+        old_display = entry.get("display_name")
+        old_path = entry.get("portrait_path")
+        if old_display != new_display or old_path != new_path:
+            logger.info(
+                "Identity %s: '%s' (%s) -> '%s' (%s) via %s",
+                entry.get("name"), old_display, old_path,
+                new_display, new_path, match_type,
+            )
+        entry["display_name"] = new_display
+        entry["portrait_path"] = new_path
+        if h is not None:
+            entry["portrait_sha256"] = h
+
+
+def _recover_orphans_by_embedding(
+    identities_dir: Path, existing: list[dict],
+) -> int:
+    """Match orphan portrait PNGs to unclaimed identity centroids via InsightFace.
+
+    Last-resort bootstrap when sha256 and stem matching have both failed (e.g. a
+    rename + content-edit, or a first migration where index.json never stored
+    sha256). For each orphan PNG: detect the largest face, embed it, and
+    Hungarian-assign to the nearest unclaimed centroid under
+    IDENTITY_MATCH_THRESHOLD. Mutates `existing` in place. Returns count linked.
+    """
+    if not identities_dir.exists():
+        return 0
+    pngs = sorted(identities_dir.glob("*.png"))
+    if not pngs:
+        return 0
+
+    claimed_hashes = {
+        e.get("portrait_sha256") for e in existing
+        if isinstance(e.get("portrait_sha256"), str)
+    }
+    orphans: list[Path] = []
+    for png in pngs:
+        h = _sha256_file(png)
+        if h is not None and h in claimed_hashes:
+            continue
+        orphans.append(png)
+    if not orphans:
+        return 0
+
+    unclaimed: list[dict] = [
+        e for e in existing
+        if not isinstance(e.get("portrait_sha256"), str)
+        or not e["portrait_sha256"]
+    ]
+    if not unclaimed:
+        logger.info(
+            "Found %d orphan portrait(s) but no unclaimed identities to match.",
+            len(orphans),
+        )
+        return 0
+
+    logger.info(
+        "Attempting face-embedding recovery for %d orphan portrait(s) against "
+        "%d unclaimed centroid(s).",
+        len(orphans), len(unclaimed),
+    )
+
+    import cv2
+    from insightface.app import FaceAnalysis
+
+    face_app = FaceAnalysis(
+        name="buffalo_l",
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    face_app.prepare(ctx_id=0, det_size=(640, 640))
+
+    centroids = np.stack(
+        [_l2_normalize(np.asarray(e["centroid"], dtype=np.float32))
+         for e in unclaimed], axis=0,
+    )
+
+    def _pad_for_detect(bgr: np.ndarray, factor: float = 2.0) -> np.ndarray:
+        """Gray-pad a tight face crop so the detector has surrounding context."""
+        h, w = bgr.shape[:2]
+        nh, nw = int(h * factor), int(w * factor)
+        canvas = np.full((nh, nw, 3), 128, dtype=np.uint8)
+        y0, x0 = (nh - h) // 2, (nw - w) // 2
+        canvas[y0:y0 + h, x0:x0 + w] = bgr
+        return canvas
+
+    cost = np.full((len(orphans), len(unclaimed)), 1.0, dtype=np.float32)
+    embeddings: list[np.ndarray | None] = [None] * len(orphans)
+    for oi, png in enumerate(orphans):
+        bgr = cv2.imread(str(png))
+        if bgr is None:
+            continue
+        # Portraits are 256x256 face crops; the detector won't fire on those
+        # without context, so pad before detection.
+        faces = face_app.get(_pad_for_detect(bgr, 2.0))
+        if not faces:
+            logger.info("No face detected in orphan %s; skipping.", png.name)
+            continue
+        faces.sort(
+            key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+            reverse=True,
+        )
+        emb = _l2_normalize(np.asarray(faces[0].normed_embedding, dtype=np.float32))
+        embeddings[oi] = emb
+        cost[oi, :] = 1.0 - (centroids @ emb)
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    linked = 0
+    for r, c in zip(row_ind, col_ind):
+        if embeddings[r] is None:
+            continue
+        d = float(cost[r, c])
+        png = orphans[r]
+        entry = unclaimed[c]
+        if d > ORPHAN_MATCH_THRESHOLD:
+            logger.info(
+                "Orphan %s: nearest unclaimed identity %s d=%.3f > %.2f; skipping.",
+                png.name, entry["name"], d, ORPHAN_MATCH_THRESHOLD,
+            )
+            continue
+        new_display = png.stem
+        new_path = f"data/identities/{png.name}"
+        new_hash = _sha256_file(png)
+        logger.info(
+            "Recovered orphan: %s -> %s (display='%s', d=%.3f)",
+            png.name, entry["name"], new_display, d,
+        )
+        entry["display_name"] = new_display
+        entry["portrait_path"] = new_path
+        if new_hash is not None:
+            entry["portrait_sha256"] = new_hash
+        linked += 1
+    return linked
 
 
 def _collect_embeddings(df: pd.DataFrame) -> tuple[np.ndarray, list[int]]:
@@ -252,6 +465,11 @@ def run_clustering(cfg: RunConfig) -> dict | None:
     identities_dir.mkdir(parents=True, exist_ok=True)
     index_path = identities_dir / "index.json"
     existing = _load_identity_index(index_path)
+    # Reflect any file renames the user did since last run so subsequent steps
+    # see the up-to-date display_name / portrait_path.
+    _sync_identity_names(identities_dir, existing)
+    # Last-resort: link any remaining orphan portraits by re-embedding their faces.
+    _recover_orphans_by_embedding(identities_dir, existing)
     existing_names = {e["name"] for e in existing if isinstance(e.get("name"), str)}
 
     new_centroids = (
@@ -271,24 +489,27 @@ def run_clustering(cfg: RunConfig) -> dict | None:
             name = entry["name"]
             entry["centroid"] = cluster["centroid"].tolist()
             entry["member_count"] = len(cluster["member_rows"])
-            entry["portrait_path"] = f"data/identities/{name}.png"
-            # Preserve user-edited display_name; backfill for entries from
-            # older runs that pre-date the field.
+            # Backfill display_name/portrait_path for entries from older runs
+            # that pre-date these fields. Don't overwrite user-edited values
+            # (renames are propagated by _sync_identity_names before this loop).
             entry.setdefault("display_name", name)
+            entry.setdefault("portrait_path", f"data/identities/{name}.png")
             matched_existing += 1
+            is_new = False
         else:
             name = _next_placeholder_name(existing_names)
             existing_names.add(name)
-            existing.append({
+            entry = {
                 "name": name,
                 "display_name": name,
                 "centroid": cluster["centroid"].tolist(),
                 "member_count": len(cluster["member_rows"]),
                 "portrait_path": f"data/identities/{name}.png",
-            })
+            }
+            existing.append(entry)
             new_identities += 1
+            is_new = True
 
-        # Save portrait PNG
         rep_row = df.iloc[cluster["representative_row"]]
         rep_kept = rep_row.get("kept_path")
         bbox = (
@@ -297,18 +518,23 @@ def run_clustering(cfg: RunConfig) -> dict | None:
             _safe_float(rep_row.get("face_x2")),
             _safe_float(rep_row.get("face_y2")),
         )
-        if (
+
+        # Save a portrait only for newly-created identities; matched ones keep
+        # the user's curated PNG sticky across runs.
+        if is_new and (
             isinstance(rep_kept, str)
             and rep_kept
             and not pd.isna(rep_kept)
             and None not in bbox
         ):
-            _save_portrait(
+            sha = _save_portrait(
                 Path(rep_kept),
                 bbox,
                 parse_kps(rep_row.get("kps")),
                 identities_dir / f"{name}.png",
             )
+            if sha is not None:
+                entry["portrait_sha256"] = sha
 
         # Build frame_ids for this cluster
         frame_ids: list[str] = []

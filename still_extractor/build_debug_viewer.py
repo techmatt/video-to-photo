@@ -3,10 +3,12 @@
 import html
 import json
 import logging
+import os
 from argparse import ArgumentParser
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from still_extractor.build_photo_viewer import (
@@ -17,6 +19,7 @@ from still_extractor.build_photo_viewer import (
 from still_extractor.constants import (
     IMAGE_EXTENSIONS,
     UPRIGHTER_CONFIDENCE_THRESHOLD,
+    card_key,
 )
 from still_extractor.inventory import RunConfig
 from still_extractor.utils import (
@@ -26,6 +29,125 @@ from still_extractor.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+IDENTITIES_DIR = Path("data/identities")
+
+
+def _parse_embedding(val) -> np.ndarray | None:
+    """Parse a JSON-encoded face embedding column to a numpy array, or None."""
+    if val is None:
+        return None
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    try:
+        arr = json.loads(val) if isinstance(val, str) else val
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(arr, (list, tuple)) or len(arr) == 0:
+        return None
+    try:
+        out = np.asarray(arr, dtype=np.float32)
+    except (TypeError, ValueError):
+        return None
+    if out.ndim != 1:
+        return None
+    return out
+
+
+def _l2_normalize(v: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(v))
+    if norm == 0.0:
+        return v
+    return v / norm
+
+
+def _load_identities(index_path: Path) -> list[dict]:
+    """Return identities with parsed centroids, or [] if file missing/invalid."""
+    if not index_path.exists():
+        return []
+    try:
+        raw = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Could not parse %s: %s", index_path, e)
+        return []
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        centroid_raw = entry.get("centroid")
+        if not isinstance(name, str) or not isinstance(centroid_raw, list):
+            continue
+        try:
+            centroid = _l2_normalize(np.asarray(centroid_raw, dtype=np.float32))
+        except (TypeError, ValueError):
+            continue
+        if centroid.ndim != 1 or centroid.shape[0] == 0:
+            continue
+        display = entry.get("display_name")
+        portrait = entry.get("portrait_path")
+        out.append({
+            "name": name,
+            "display_name": display if isinstance(display, str) and display else name,
+            "centroid": centroid,
+            "portrait_path": (
+                portrait if isinstance(portrait, str) and portrait
+                else f"data/identities/{name}.png"
+            ),
+        })
+    return out
+
+
+def _load_cluster_membership(clusters_path: Path) -> dict[str, set[str]]:
+    """Return a map identity-name -> set of card_keys. Empty dict if missing."""
+    if not clusters_path.exists():
+        return {}
+    try:
+        raw = json.loads(clusters_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Could not parse %s: %s", clusters_path, e)
+        return {}
+    out: dict[str, set[str]] = {}
+    for cluster in raw.get("clusters", []) if isinstance(raw, dict) else []:
+        if not isinstance(cluster, dict):
+            continue
+        name = cluster.get("identity")
+        frame_ids = cluster.get("frame_ids", [])
+        if not isinstance(name, str) or not isinstance(frame_ids, list):
+            continue
+        out[name] = {fid for fid in frame_ids if isinstance(fid, str)}
+    return out
+
+
+def _portrait_relpath(portrait_path: str, html_dir: Path) -> str | None:
+    """Return relpath from html_dir to the given portrait_path (project-relative), or None."""
+    portrait = Path(portrait_path).resolve()
+    if not portrait.exists():
+        return None
+    try:
+        rel = os.path.relpath(portrait, html_dir.resolve())
+    except ValueError:
+        return None
+    return _to_fwd_slash(rel)
+
+
+def _nearest_identity(
+    emb: np.ndarray, identities: list[dict],
+) -> tuple[int, float] | None:
+    """Return (identity_index, cosine_distance) for the nearest centroid, or None."""
+    if not identities or emb.size == 0:
+        return None
+    emb_n = _l2_normalize(emb)
+    centroids = np.stack([ident["centroid"] for ident in identities], axis=0)
+    if centroids.shape[1] != emb_n.shape[0]:
+        return None
+    sims = centroids @ emb_n
+    best = int(np.argmax(sims))
+    dist = float(1.0 - sims[best])
+    return best, dist
 
 
 CSS = """
@@ -295,6 +417,81 @@ header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; }
 }
 #overlay-nav-prev { left: 14px; }
 #overlay-nav-next { right: calc(35% + 14px); }
+
+/* ---------- Face table ---------- */
+
+.face-table {
+  display: grid;
+  grid-template-columns: 18px 56px 38px 22px 1fr 38px 56px;
+  align-items: center;
+  gap: 4px 6px;
+  font-size: 12px;
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.face-table .ft-head {
+  color: #6b7280;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.face-row {
+  display: contents;
+  cursor: pointer;
+}
+.face-row.highlighted .ft-cell { background: rgba(74, 127, 208, 0.18); }
+.face-row .ft-cell {
+  padding: 3px 2px;
+}
+.face-row .ft-num { color: #d1d5db; }
+.face-row .ft-quality { font-weight: 600; }
+.face-row .ft-qscore { color: #9ca3af; text-align: right; }
+.face-row .ft-portrait img {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+}
+.face-row .ft-identity { color: #f3f4f6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.face-row .ft-identity.nearest-only { color: #94a3b8; font-style: italic; }
+.face-row .ft-iscore { color: #cbd5e1; text-align: right; }
+.face-row .ft-confbar {
+  position: relative;
+  height: 9px;
+  background: #1f2330;
+  border-radius: 2px;
+  overflow: hidden;
+}
+.face-row .ft-confbar .seg {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: #4ade80;
+  opacity: 0.85;
+}
+.face-row .ft-confbar.nearest-only .seg { background: #6b7280; }
+
+/* ---------- Bbox hover tooltip ---------- */
+
+#bbox-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: rgba(15, 18, 24, 0.95);
+  border: 1px solid #2a2d36;
+  border-radius: 5px;
+  padding: 6px 9px;
+  font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+  color: #f3f4f6;
+  z-index: 5;
+  max-width: 320px;
+  display: none;
+  white-space: nowrap;
+}
+#bbox-tooltip .tt-title { color: #f9fafb; font-weight: 600; margin-bottom: 2px; }
+#bbox-tooltip .tt-row { color: #cbd5e1; }
+#bbox-tooltip .tt-row.muted { color: #94a3b8; font-style: italic; }
+#bbox-tooltip .tt-row.warn { color: #f97316; }
 """
 
 
@@ -305,6 +502,7 @@ const SORT_KEY = 'photoViewer.sort';
 const FLAG_PREFIX = 'flag:';
 
 const FRAMES_DATA = __FRAMES_DATA__;
+const IDENTITY_PORTRAITS = __IDENTITY_PORTRAITS__;
 
 const LABEL_COLORS = {
   good: '#4ade80',
@@ -319,6 +517,9 @@ let currentSort = 'confidence';
 let overlayIndex = -1;
 let lastLayoutContainerWidth = -1;
 let showRejected = false;
+let highlightedFace = -1;
+let hoveredAcceptedFace = -1;
+let hoveredRejectedFace = -1;
 const SHOW_REJECTED_KEY = 'photoViewer.showRejected';
 
 function flagKey(card) { return FLAG_PREFIX + card.dataset.exportPath; }
@@ -543,6 +744,224 @@ function buildClassifierBars(frame) {
   return out;
 }
 
+function buildConfBar(conf, nearestOnly) {
+  const segs = 10;
+  const filled = Math.max(0, Math.min(segs, Math.round(conf * segs)));
+  let html = '';
+  for (let i = 0; i < segs; i++) {
+    if (i >= filled) continue;
+    const left = (i * (100 / segs)).toFixed(1);
+    const width = (100 / segs - 1).toFixed(2);
+    html += `<div class="seg" style="left:${left}%;width:${width}%;"></div>`;
+  }
+  const cls = nearestOnly ? 'ft-confbar nearest-only' : 'ft-confbar';
+  return `<div class="${cls}">${html}</div>`;
+}
+
+function buildFaceTable(frame) {
+  const faces = Array.isArray(frame.faces) ? frame.faces : [];
+  const identities = Array.isArray(frame.face_identities) ? frame.face_identities : [];
+  const anyFace = faces.some(f => f && f.x1 != null);
+  if (!anyFace) return '';
+  const hasIdentities = identities.some(i => i);
+
+  let head = `<div class="face-table">`
+    + `<div class="ft-head">#</div>`
+    + `<div class="ft-head">Quality</div>`
+    + `<div class="ft-head"></div>`;
+  if (hasIdentities) {
+    head += `<div class="ft-head"></div>`
+      +    `<div class="ft-head">Identity</div>`
+      +    `<div class="ft-head"></div>`
+      +    `<div class="ft-head"></div>`;
+  } else {
+    head += `<div class="ft-head" style="grid-column: span 4;"></div>`;
+  }
+
+  let rows = '';
+  for (let i = 0; i < faces.length; i++) {
+    const face = faces[i];
+    if (!face || face.x1 == null) continue;
+    const label = face.pred_label || 'none';
+    const color = LABEL_COLORS[label] || '#888';
+    const conf = face.pred_confidence;
+    const highlighted = (highlightedFace === i) ? ' highlighted' : '';
+    const ident = identities[i] || null;
+
+    let identCells;
+    if (!hasIdentities) {
+      identCells = `<div class="ft-cell" style="grid-column: span 4;"></div>`;
+    } else if (ident) {
+      const portraitUrl = IDENTITY_PORTRAITS[ident.identity];
+      const portraitImg = portraitUrl
+        ? `<img src="${escHtml(portraitUrl)}" alt="" onerror="this.style.display='none'">`
+        : '';
+      const nearestOnly = !ident.assigned;
+      const cls = nearestOnly ? 'ft-identity nearest-only' : 'ft-identity';
+      const suffix = nearestOnly ? ' (nearest)' : '';
+      const displayName = ident.display_name || ident.identity;
+      identCells =
+        `<div class="ft-cell ft-portrait">${portraitImg}</div>`
+        + `<div class="ft-cell ${cls}" title="${escHtml(displayName)}${suffix}">`
+        +   `${escHtml(displayName)}${suffix}`
+        + `</div>`
+        + `<div class="ft-cell ft-iscore">${fmtNum(ident.confidence, 2)}</div>`
+        + `<div class="ft-cell">${buildConfBar(ident.confidence, nearestOnly)}</div>`;
+    } else {
+      identCells =
+        `<div class="ft-cell"></div>`
+        + `<div class="ft-cell" style="color:#6b7280">-</div>`
+        + `<div class="ft-cell"></div>`
+        + `<div class="ft-cell"></div>`;
+    }
+
+    rows += `<div class="face-row${highlighted}" data-face-idx="${i}">`
+      + `<div class="ft-cell ft-num">${i + 1}</div>`
+      + `<div class="ft-cell ft-quality" style="color:${color}">${label}</div>`
+      + `<div class="ft-cell ft-qscore">${fmtNum(conf, 2)}</div>`
+      + identCells
+      + `</div>`;
+  }
+  return head + rows + `</div>`;
+}
+
+function currentFrame() {
+  const card = visibleCards()[overlayIndex];
+  if (!card) return null;
+  const frameIdx = parseInt(card.dataset.frameIdx, 10);
+  if (isNaN(frameIdx)) return null;
+  return FRAMES_DATA[frameIdx] || null;
+}
+
+function hideTooltip() {
+  const tt = document.getElementById('bbox-tooltip');
+  if (tt) tt.style.display = 'none';
+}
+
+function showTooltip(html, clientX, clientY) {
+  const tt = document.getElementById('bbox-tooltip');
+  const left = document.getElementById('overlay-left');
+  if (!tt || !left) return;
+  const rect = left.getBoundingClientRect();
+  tt.innerHTML = html;
+  tt.style.display = 'block';
+  const ttRect = tt.getBoundingClientRect();
+  let x = clientX - rect.left + 14;
+  let y = clientY - rect.top + 14;
+  if (x + ttRect.width > rect.width) x = clientX - rect.left - ttRect.width - 14;
+  if (y + ttRect.height > rect.height) y = clientY - rect.top - ttRect.height - 14;
+  tt.style.left = Math.max(0, x) + 'px';
+  tt.style.top = Math.max(0, y) + 'px';
+}
+
+function buildAcceptedTooltipHtml(face, ident, idx) {
+  const label = face.pred_label || 'none';
+  const conf = (face.pred_confidence != null) ? fmtNum(face.pred_confidence, 2) : '-';
+  const color = LABEL_COLORS[label] || '#888';
+  let h = `<div class="tt-title">Face ${idx + 1}: <span style="color:${color}">${escHtml(label)}</span> ${conf}</div>`;
+  if (ident) {
+    const name = escHtml(ident.display_name || ident.identity);
+    const c = fmtNum(ident.confidence, 2);
+    if (ident.assigned) {
+      h += `<div class="tt-row">identity: ${name} ${c}</div>`;
+    } else {
+      h += `<div class="tt-row muted">nearest: ${name} ${c}</div>`;
+    }
+  }
+  if (face.kps_anomalous) {
+    h += `<div class="tt-row warn">kps anomalous</div>`;
+  }
+  return h;
+}
+
+function buildRejectedTooltipHtml(rej, idx) {
+  return `<div class="tt-title">Rejected face</div>`
+    + `<div class="tt-row warn">${escHtml(rej.reason || 'rejected')}</div>`;
+}
+
+function imageDisplayRect() {
+  const img = document.getElementById('overlay-img');
+  const left = document.getElementById('overlay-left');
+  if (!img || !left) return null;
+  const containerW = img.clientWidth;
+  const containerH = img.clientHeight;
+  const natW = img.naturalWidth;
+  const natH = img.naturalHeight;
+  if (!natW || !natH || !containerW || !containerH) return null;
+  const scale = Math.min(containerW / natW, containerH / natH);
+  const dispW = natW * scale;
+  const dispH = natH * scale;
+  const offsetX = (containerW - dispW) / 2;
+  const offsetY = (containerH - dispH) / 2;
+  return { dispW, dispH, offsetX, offsetY, natW, natH, scale };
+}
+
+function hitTestFace(clientX, clientY) {
+  const frame = currentFrame();
+  if (!frame) return { accepted: -1, rejected: -1 };
+  const img = document.getElementById('overlay-img');
+  if (!img) return { accepted: -1, rejected: -1 };
+  const r = img.getBoundingClientRect();
+  const rect = imageDisplayRect();
+  if (!rect) return { accepted: -1, rejected: -1 };
+  const lx = clientX - r.left - rect.offsetX;
+  const ly = clientY - r.top - rect.offsetY;
+  if (lx < 0 || ly < 0 || lx > rect.dispW || ly > rect.dispH) {
+    return { accepted: -1, rejected: -1 };
+  }
+  const fw = frame.frame_w || rect.natW;
+  const fh = frame.frame_h || rect.natH;
+  const ix = lx * (fw / rect.dispW);
+  const iy = ly * (fh / rect.dispH);
+
+  let accepted = -1;
+  const faces = Array.isArray(frame.faces) ? frame.faces : [];
+  for (let i = 0; i < faces.length; i++) {
+    const f = faces[i];
+    if (!f || f.x1 == null) continue;
+    if (ix >= f.x1 && ix <= f.x2 && iy >= f.y1 && iy <= f.y2) { accepted = i; break; }
+  }
+  let rejected = -1;
+  if (showRejected && accepted < 0) {
+    const rs = Array.isArray(frame.rejected_faces) ? frame.rejected_faces : [];
+    for (let i = 0; i < rs.length; i++) {
+      const r2 = rs[i];
+      if (r2.x1 == null) continue;
+      if (ix >= r2.x1 && ix <= r2.x2 && iy >= r2.y1 && iy <= r2.y2) { rejected = i; break; }
+    }
+  }
+  return { accepted, rejected };
+}
+
+function onOverlayMouseMove(e) {
+  if (overlayIndex < 0) return;
+  const frame = currentFrame();
+  if (!frame) { hideTooltip(); return; }
+  const { accepted, rejected } = hitTestFace(e.clientX, e.clientY);
+  if (accepted >= 0) {
+    const face = frame.faces[accepted];
+    const ident = (frame.face_identities && frame.face_identities[accepted]) || null;
+    showTooltip(buildAcceptedTooltipHtml(face, ident, accepted), e.clientX, e.clientY);
+  } else if (rejected >= 0) {
+    const rej = frame.rejected_faces[rejected];
+    showTooltip(buildRejectedTooltipHtml(rej, rejected), e.clientX, e.clientY);
+  } else {
+    hideTooltip();
+  }
+  if (hoveredAcceptedFace !== accepted || hoveredRejectedFace !== rejected) {
+    hoveredAcceptedFace = accepted;
+    hoveredRejectedFace = rejected;
+    drawOverlayAnnotations();
+  }
+}
+
+function onOverlayMouseLeave() {
+  hoveredAcceptedFace = -1;
+  hoveredRejectedFace = -1;
+  hideTooltip();
+  drawOverlayAnnotations();
+}
+
 function buildScoresHtml(frame) {
   const ts = frame.refined_timestamp_s != null ? frame.refined_timestamp_s : frame.timestamp_s;
   const tsRaw = frame.timestamp_s;
@@ -603,6 +1022,7 @@ function buildScoresHtml(frame) {
   if (bestPair != null) {
     facesSection += `<div class="small">best pair score: ${fmtNum(bestPair, 2)}</div>`;
   }
+  facesSection += buildFaceTable(frame);
   facesSection += `</div>`;
 
   return ''
@@ -680,7 +1100,8 @@ function drawOverlayAnnotations() {
     const face = faces[slot];
     if (!face || face.x1 == null) continue;
     const isPrimary = (slot === 0);
-    const alpha = isPrimary ? 1.0 : 0.7;
+    const isEmphasized = (slot === highlightedFace) || (slot === hoveredAcceptedFace);
+    const alpha = isEmphasized ? 1.0 : (isPrimary ? 1.0 : 0.7);
     const label = face.pred_label || 'none';
     const color = LABEL_COLORS[label] || '#888';
 
@@ -691,7 +1112,7 @@ function drawOverlayAnnotations() {
 
     ctx.save();
     ctx.globalAlpha = alpha;
-    ctx.lineWidth = isPrimary ? 3 : 2;
+    ctx.lineWidth = isEmphasized ? 4 : (isPrimary ? 3 : 2);
     ctx.strokeStyle = color;
     ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
 
@@ -739,16 +1160,18 @@ function drawOverlayAnnotations() {
 
   if (showRejected) {
     const rejected = Array.isArray(frame.rejected_faces) ? frame.rejected_faces : [];
-    for (const r of rejected) {
+    for (let ri = 0; ri < rejected.length; ri++) {
+      const r = rejected[ri];
       if (r.x1 == null || r.x2 == null || r.y1 == null || r.y2 == null) continue;
       const x1 = r.x1 * sx;
       const y1 = r.y1 * sy;
       const x2 = r.x2 * sx;
       const y2 = r.y2 * sy;
+      const isHovered = (ri === hoveredRejectedFace);
       ctx.save();
       ctx.setLineDash([6, 4]);
-      ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = isHovered ? 'rgba(239, 68, 68, 1.0)' : 'rgba(239, 68, 68, 0.5)';
+      ctx.lineWidth = isHovered ? 3 : 2;
       ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
       ctx.setLineDash([]);
       ctx.fillStyle = 'rgba(239, 68, 68, 0.85)';
@@ -765,6 +1188,10 @@ function openOverlay(idx) {
   const cards = visibleCards();
   if (idx < 0 || idx >= cards.length) return;
   overlayIndex = idx;
+  highlightedFace = -1;
+  hoveredAcceptedFace = -1;
+  hoveredRejectedFace = -1;
+  hideTooltip();
   const card = cards[idx];
   const frameIdx = parseInt(card.dataset.frameIdx, 10);
   const frame = FRAMES_DATA[frameIdx];
@@ -798,6 +1225,16 @@ function renderOverlayScores(frame) {
       drawOverlayAnnotations();
     });
   }
+  document.querySelectorAll('.face-row').forEach(row => {
+    row.addEventListener('click', e => {
+      e.stopPropagation();
+      const idx = parseInt(row.dataset.faceIdx, 10);
+      if (isNaN(idx)) return;
+      highlightedFace = (highlightedFace === idx) ? -1 : idx;
+      renderOverlayScores(frame);
+      drawOverlayAnnotations();
+    });
+  });
 }
 
 function closeOverlay() {
@@ -807,6 +1244,10 @@ function closeOverlay() {
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   overlayIndex = -1;
+  highlightedFace = -1;
+  hoveredAcceptedFace = -1;
+  hoveredRejectedFace = -1;
+  hideTooltip();
 }
 
 function overlayNav(dir) {
@@ -900,6 +1341,12 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('overlay-nav-prev').addEventListener('click', () => overlayNav(-1));
   document.getElementById('overlay-nav-next').addEventListener('click', () => overlayNav(1));
 
+  const overlayLeft = document.getElementById('overlay-left');
+  if (overlayLeft) {
+    overlayLeft.addEventListener('mousemove', onOverlayMouseMove);
+    overlayLeft.addEventListener('mouseleave', onOverlayMouseLeave);
+  }
+
   document.addEventListener('keydown', e => {
     if (overlayIndex >= 0) {
       if (e.key === 'Escape') { closeOverlay(); e.preventDefault(); }
@@ -945,12 +1392,60 @@ def _face_slot_payload(row: pd.Series, slot: int) -> dict | None:
         "y2": _opt_int(row.get(f"face_{slot}_y2")),
         "det_score": _safe_float(row.get(f"face_{slot}_det_score")),
         "kps": _parse_kps(row.get(f"face_{slot}_kps")),
+        "kps_anomalous": _opt_bool(row.get(f"face_{slot}_kps_anomalous")),
         "p_none": _safe_float(row.get(f"face_{slot}_p_none")),
         "p_bad":  _safe_float(row.get(f"face_{slot}_p_bad")),
         "p_okay": _safe_float(row.get(f"face_{slot}_p_okay")),
         "p_good": _safe_float(row.get(f"face_{slot}_p_good")),
         "pred_label": pred_label,
         "pred_confidence": _safe_float(row.get(f"face_{slot}_pred_confidence")),
+    }
+
+
+def _opt_bool(val) -> bool | None:
+    if val is None:
+        return None
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    return bool(val)
+
+
+def _face_identity_payload(
+    row: pd.Series,
+    slot: int,
+    identities: list[dict],
+    membership: dict[str, set[str]],
+    has_embedding_cols: bool,
+) -> dict | None:
+    """Compute the per-face identity entry for face slot, or None."""
+    if not identities or not has_embedding_cols:
+        return None
+    if _opt_int(row.get(f"face_{slot}_x1")) is None:
+        return None
+    emb = _parse_embedding(row.get(f"face_{slot}_embedding"))
+    if emb is None:
+        return None
+    nearest = _nearest_identity(emb, identities)
+    if nearest is None:
+        return None
+    idx, dist = nearest
+    ident = identities[idx]
+    confidence = max(0.0, min(1.0, 1.0 - dist))
+    stem = row.get("video_stem")
+    kept = row.get("kept_path")
+    assigned = False
+    if (
+        isinstance(stem, str) and stem
+        and isinstance(kept, str) and kept
+    ):
+        ck = card_key(stem, kept)
+        assigned = ck in membership.get(ident["name"], set())
+    return {
+        "identity": ident["name"],
+        "display_name": ident["display_name"],
+        "confidence": float(confidence),
+        "distance": float(dist),
+        "assigned": bool(assigned),
     }
 
 
@@ -986,6 +1481,9 @@ def _build_frame_json(
     row: pd.Series,
     kept_path: Path,
     is_image_source: bool,
+    identities: list[dict],
+    membership: dict[str, set[str]],
+    has_embedding_cols: bool,
 ) -> dict:
     """Per-frame debug payload baked into the page as JSON."""
     f = _safe_float
@@ -1000,6 +1498,10 @@ def _build_frame_json(
     video_basename = Path(video_path).name if video_path else ""
 
     faces = [_face_slot_payload(row, slot) for slot in (1, 2, 3)]
+    face_identities = [
+        _face_identity_payload(row, slot, identities, membership, has_embedding_cols)
+        for slot in (1, 2, 3)
+    ]
     face_count = _opt_int(row.get("face_count"))
     best_pair_score = f(row.get("best_pair_score"))
     rejected_faces = _parse_rejected_faces(row.get("rejected_faces_json"))
@@ -1013,6 +1515,7 @@ def _build_frame_json(
         "frame_w": _opt_int(row.get("frame_w")),
         "frame_h": _opt_int(row.get("frame_h")),
         "faces": faces,
+        "face_identities": face_identities,
         "face_count": face_count,
         "best_pair_score": best_pair_score,
         "rejected_faces": rejected_faces,
@@ -1116,6 +1619,8 @@ def main() -> None:
             args.results = cfg.output_dir / "results.parquet"
         if args.output_html is None:
             args.output_html = cfg.output_dir / "index_photos_debug.html"
+    else:
+        cfg = None
     if args.results is None or args.output_html is None:
         parser.error(
             "--results and --output-html are required when --config is not provided",
@@ -1131,6 +1636,44 @@ def main() -> None:
 
     html_dir = args.output_html.parent
     html_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Identity setup ---------------------------------------------------
+    has_embedding_cols = all(
+        f"face_{s}_embedding" in df.columns for s in (1, 2, 3)
+    )
+    identities: list[dict] = []
+    membership: dict[str, set[str]] = {}
+    portraits: dict[str, str] = {}
+    if not has_embedding_cols:
+        logger.warning(
+            "Per-face embeddings not found in results.parquet "
+            "(missing face_N_embedding columns) -- re-run pipeline to enable "
+            "identity display. Building viewer without identity data.",
+        )
+    else:
+        index_path = IDENTITIES_DIR / "index.json"
+        identities = _load_identities(index_path)
+        if identities:
+            logger.info("Loaded %d identities from %s", len(identities), index_path)
+            clusters_path = (
+                cfg.output_dir / "clusters.json" if cfg is not None
+                else args.output_html.parent / "clusters.json"
+            )
+            membership = _load_cluster_membership(clusters_path)
+            if not membership:
+                logger.info(
+                    "clusters.json missing or empty at %s -- identities will be "
+                    "shown as nearest-only (no hard assignments).", clusters_path,
+                )
+            for ident in identities:
+                rel = _portrait_relpath(ident["portrait_path"], html_dir)
+                if rel is not None:
+                    portraits[ident["name"]] = rel
+        else:
+            logger.info(
+                "No identities found at %s -- skipping identity display",
+                IDENTITIES_DIR / "index.json",
+            )
 
     cards: list[str] = []
     frames: list[dict] = []
@@ -1170,7 +1713,10 @@ def main() -> None:
             aspect = 1.0
 
         frame_idx = len(frames)
-        frames.append(_build_frame_json(row, kept_p, is_image_source))
+        frames.append(_build_frame_json(
+            row, kept_p, is_image_source,
+            identities, membership, has_embedding_cols,
+        ))
         cards.append(_build_card(
             row, thumb_src, export_path, aspect, rotation, is_image_source, frame_idx,
         ))
@@ -1183,7 +1729,12 @@ def main() -> None:
     )
 
     frames_json = json.dumps(frames, separators=(",", ":"), allow_nan=False)
-    js_source = JS_TEMPLATE.replace("__FRAMES_DATA__", frames_json)
+    portraits_json = json.dumps(portraits, separators=(",", ":"))
+    js_source = (
+        JS_TEMPLATE
+        .replace("__FRAMES_DATA__", frames_json)
+        .replace("__IDENTITY_PORTRAITS__", portraits_json)
+    )
 
     body = f"""<!doctype html>
 <html lang="en">
@@ -1233,6 +1784,7 @@ def main() -> None:
     <div id="overlay-left">
       <img id="overlay-img" src="" alt="">
       <canvas id="overlay-canvas"></canvas>
+      <div id="bbox-tooltip"></div>
     </div>
     <div id="overlay-right">
       <div id="overlay-scores"></div>
@@ -1263,6 +1815,9 @@ def main() -> None:
         "image_source": image_source_count,
         "output_html": str(args.output_html),
         "file_size_mb": round(file_size_mb, 2),
+        "has_embedding_cols": bool(has_embedding_cols),
+        "identity_count": len(identities),
+        "identities_with_portraits": len(portraits),
     }
     summary_path = args.output_html.parent / "build_debug_viewer_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
