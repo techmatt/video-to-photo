@@ -10,6 +10,7 @@ import argparse
 import csv
 import json
 import logging
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -183,6 +184,28 @@ def _aggregate_stage_times(
     for key in STAGE_KEYS:
         pct[key] = 100.0 * block[key]["total"] / stage_sum if stage_sum > 0 else 0.0
     return block, pct
+
+
+def _build_viewers(config_path: Path) -> None:
+    """Invoke build_faces_review then build_photo_viewer as subprocesses.
+
+    Subprocess gives clean isolation from the pipeline's loaded models and
+    matches how users invoke these stages manually. Failures are logged but
+    do not abort — the parquet is already on disk and the user can re-run.
+    """
+    viewers = [
+        ("build_faces_review", "still_extractor.build_faces_review"),
+        ("build_photo_viewer", "still_extractor.build_photo_viewer"),
+    ]
+    for name, module in viewers:
+        print(f"───── {name} ─────")
+        try:
+            subprocess.run(
+                [sys.executable, "-m", module, "--config", str(config_path)],
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            logger.warning("%s failed with exit code %d", name, e.returncode)
 
 
 def _print_stage_timing_table(
@@ -441,6 +464,9 @@ def main() -> None:
     )
     print("───────────────────────────────────────")
     _print_stage_timing_table(stage_times_block, stage_times_pct)
+
+    if not test_mode and parquet_out.exists():
+        _build_viewers(args.config)
 
 
 if __name__ == "__main__":
