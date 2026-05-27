@@ -1,10 +1,10 @@
 """Cluster face identities from results.parquet using ArcFace embeddings.
 
 Runs DBSCAN (cosine metric) over per-frame embeddings, matches each cluster
-centroid against a persistent global identity store (data/identities/), and
+centroid against a persistent global identity store (data/ground_truth/identities/), and
 writes a per-run clusters.json keyed by card_key() so the photo viewer can
 filter frames by identity. New identities get placeholder names (personA,
-personB, ...); the user can rename portraits in data/identities/ by editing
+personB, ...); the user can rename portraits in data/ground_truth/identities/ by editing
 index.json + renaming the matching PNG.
 """
 
@@ -199,7 +199,7 @@ def _sync_identity_names(identities_dir: Path, existing: list[dict]) -> None:
         claimed.add(id(entry))
 
         new_display = png.stem
-        new_path = f"data/identities/{png.name}"
+        new_path = f"data/ground_truth/identities/{png.name}"
         old_display = entry.get("display_name")
         old_path = entry.get("portrait_path")
         if old_display != new_display or old_path != new_path:
@@ -320,7 +320,7 @@ def _recover_orphans_by_embedding(
             )
             continue
         new_display = png.stem
-        new_path = f"data/identities/{png.name}"
+        new_path = f"data/ground_truth/identities/{png.name}"
         new_hash = _sha256_file(png)
         logger.info(
             "Recovered orphan: %s -> %s (display='%s', d=%.3f)",
@@ -381,8 +381,8 @@ def run_clustering(cfg: RunConfig) -> dict | None:
 
     Writes:
       - `{cfg.output_dir}/clusters.json`
-      - `data/identities/index.json` (global, updated in place)
-      - `data/identities/{name}.png` (one per identity, overwritten each run)
+      - `data/ground_truth/identities/index.json` (global, updated in place)
+      - `data/ground_truth/identities/{name}.png` (one per identity, overwritten each run)
 
     Returns the cluster summary dict, or None if clustering was skipped/errored.
     """
@@ -461,7 +461,7 @@ def run_clustering(cfg: RunConfig) -> dict | None:
         })
 
     # Identity matching
-    identities_dir = Path("data/identities")
+    identities_dir = Path("data/ground_truth/identities")
     identities_dir.mkdir(parents=True, exist_ok=True)
     index_path = identities_dir / "index.json"
     existing = _load_identity_index(index_path)
@@ -493,7 +493,7 @@ def run_clustering(cfg: RunConfig) -> dict | None:
             # that pre-date these fields. Don't overwrite user-edited values
             # (renames are propagated by _sync_identity_names before this loop).
             entry.setdefault("display_name", name)
-            entry.setdefault("portrait_path", f"data/identities/{name}.png")
+            entry.setdefault("portrait_path", f"data/ground_truth/identities/{name}.png")
             matched_existing += 1
             is_new = False
         else:
@@ -504,7 +504,7 @@ def run_clustering(cfg: RunConfig) -> dict | None:
                 "display_name": name,
                 "centroid": cluster["centroid"].tolist(),
                 "member_count": len(cluster["member_rows"]),
-                "portrait_path": f"data/identities/{name}.png",
+                "portrait_path": f"data/ground_truth/identities/{name}.png",
             }
             existing.append(entry)
             new_identities += 1

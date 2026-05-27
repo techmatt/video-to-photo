@@ -12,7 +12,7 @@ picked up automatically.
 
 Usage:
     uv run python -m still_extractor.compare_classifiers \\
-        --labels-store data/face_labels/labels.json
+        --labels-store data/ground_truth/face_labels/labels.json
 """
 
 import argparse

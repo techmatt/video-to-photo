@@ -1,7 +1,7 @@
 """Train a 4-class face quality classifier (None/Bad/Okay/Good).
 
 Training data comes from the global face labels store at
-``data/face_labels/labels.json`` (a JSON list whose entries point at
+``data/ground_truth/face_labels/labels.json`` (a JSON list whose entries point at
 already-extracted face crops via ``face_crop_path``). Backbone:
 MobileNetV3-Small (ImageNet pretrained), fine-tuned in two phases — first the
 classifier head, then the last InvertedResidual block plus the head. After
@@ -54,7 +54,7 @@ IDX_TO_LABEL = {v: k for k, v in LABEL_TO_IDX.items()}
 N_CLASSES = len(FACE_QUALITY_LABELS)
 DISPLAY_SIZE = FACE_QUALITY_INPUT_SIZE
 
-DEFAULT_LABELS_STORE: Path = Path("data/face_labels/labels.json")
+DEFAULT_LABELS_STORE: Path = Path("data/ground_truth/face_labels/labels.json")
 TRAIN_LABEL_SMOOTHING: float = 0.1
 MIXUP_ALPHA: float = 0.3
 MIXUP_ALPHA_GOOD_PAIR: float = 0.5
@@ -218,7 +218,7 @@ def _resolve_crop_path(raw_path: str, labels_store: Path) -> Path:
 
     Tries the path as-is (absolute, or relative to cwd) first; if that does
     not exist, falls back to resolving relative to the labels-store's parent's
-    parent (so ``data/face_labels/labels.json`` + ``data/face_labels/foo.jpg``
+    parent (so ``data/ground_truth/face_labels/labels.json`` + ``data/ground_truth/face_labels/foo.jpg``
     works regardless of cwd).
     """
     p = Path(raw_path)

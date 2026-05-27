@@ -7,7 +7,7 @@ aesthetic-score images. The full report is also saved to a sibling `.txt` file
 
 Usage:
     uv run python -m still_extractor.tools.review_descriptions \
-        --input data/june27/caption_experiments/description_comparison.jsonl
+        --input data/runs/june27/caption_experiments/description_comparison.jsonl
 """
 
 from __future__ import annotations

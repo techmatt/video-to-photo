@@ -35,7 +35,7 @@ from still_extractor.utils import (
 logger = logging.getLogger(__name__)
 
 
-IDENTITIES_DIR = Path("data/identities")
+IDENTITIES_DIR = Path("data/ground_truth/identities")
 UNKNOWN_CHIP_ID = "__unknown__"
 
 _EXIF_ORIENTATION_TAG = next(
@@ -240,7 +240,7 @@ def _load_identity_index(index_path: Path) -> dict[str, dict]:
             "display_name": display if isinstance(display, str) and display else name,
             "portrait_path": (
                 portrait if isinstance(portrait, str) and portrait
-                else f"data/identities/{name}.png"
+                else f"data/ground_truth/identities/{name}.png"
             ),
             "centroid": centroid,
         }

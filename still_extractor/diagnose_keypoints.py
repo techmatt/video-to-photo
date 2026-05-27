@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 RATIO_LOW = 0.25
 RATIO_HIGH = 0.75
 KPS_SPAN_FRAC_MIN = 0.25
-IDENTITY_INDEX_PATH = Path("data/identities/index.json")
+IDENTITY_INDEX_PATH = Path("data/ground_truth/identities/index.json")
 
 
 def _parse_embedding(val) -> np.ndarray | None:

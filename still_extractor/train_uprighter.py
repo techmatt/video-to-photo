@@ -343,7 +343,7 @@ def main() -> None:
         description="Train a 4-class rotation (uprighter) classifier on synthetic rotations.",
     )
     parser.add_argument("--frames-json", type=Path,
-                        default=Path("data/june27/uprighter_frames.json"))
+                        default=Path("data/runs/june27/uprighter_frames.json"))
     parser.add_argument("--rejected-json", type=Path,
                         default=Path("labels/rejected.json"))
     parser.add_argument("--output-dir", type=Path,

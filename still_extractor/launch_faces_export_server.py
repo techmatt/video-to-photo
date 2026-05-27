@@ -7,7 +7,7 @@ Exposes a single endpoint `POST /export` that re-reads the per-corpus
 Usage:
     uv run python -m still_extractor.launch_faces_export_server \\
         --config configs/june27.yaml \\
-        [--output-dir data/face_labels] \\
+        [--output-dir data/ground_truth/face_labels] \\
         [--port 7432]
 """
 
@@ -118,8 +118,8 @@ def main() -> None:
     )
     parser.add_argument("--config", type=Path, required=True,
                         help="Run YAML config. Determines labels-json path and corpus name.")
-    parser.add_argument("--output-dir", type=Path, default=Path("data/face_labels"),
-                        help="Global face labels store. Default: data/face_labels.")
+    parser.add_argument("--output-dir", type=Path, default=Path("data/ground_truth/face_labels"),
+                        help="Global face labels store. Default: data/ground_truth/face_labels.")
     parser.add_argument("--port", type=int, default=7432,
                         help="TCP port to bind. Default: 7432.")
     parser.add_argument("--log-level", default="INFO",

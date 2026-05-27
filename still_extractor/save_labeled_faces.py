@@ -313,7 +313,7 @@ def main() -> None:
                              "Defaults to {output_dir}/face_labels.json when --config is given.")
     parser.add_argument("--results", type=Path, default=None,
                         help="Path to results.parquet with kept_path + face bbox.")
-    parser.add_argument("--output-dir", type=Path, default=Path("data/face_labels"),
+    parser.add_argument("--output-dir", type=Path, default=Path("data/ground_truth/face_labels"),
                         help="Output directory (will contain faces/, labels.json, seen_hashes.json).")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
