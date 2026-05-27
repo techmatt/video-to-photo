@@ -85,11 +85,15 @@ def _is_truthy(v) -> bool:
     return bool(v)
 
 
-def _truncate_for_testing(
+def _apply_limits(
     manifest_df: pd.DataFrame, max_videos: int, max_images: int,
 ) -> pd.DataFrame:
-    """Test-mode truncation. When >0, cap that type to first N (smallest size_bytes).
-    When ==0, exclude that type entirely. (Both 0 means caller shouldn't call this.)
+    """Cap the per-type number of non-duplicate files to process.
+
+    When >0, cap that type to first N (smallest size_bytes). When ==0, exclude
+    that type entirely. (Both 0 means caller shouldn't call this.) Smaller-first
+    ordering means smoke-test runs finish fast and exercise the same code paths
+    a full run uses.
     """
     non_dup = manifest_df[~manifest_df["is_duplicate"].map(_is_truthy)].copy()
     keep_paths: set[str] = set()
@@ -102,7 +106,7 @@ def _truncate_for_testing(
     truncated = non_dup[non_dup["file_path"].astype(str).isin(keep_paths)]
     dropped = len(non_dup) - len(truncated)
     logger.info(
-        "Test mode: keeping %d/%d non-duplicate files (dropped %d)",
+        "Limited run: keeping %d/%d non-duplicate files (dropped %d)",
         len(truncated), len(non_dup), dropped,
     )
     return truncated
@@ -254,9 +258,9 @@ def main() -> None:
     parser.add_argument("--rescan", action="store_true",
                         help="Reprocess all files even if marked done in pipeline_status.csv.")
     parser.add_argument("--max-videos", type=int, default=0,
-                        help="Test mode: cap number of non-duplicate videos processed.")
+                        help="Cap number of non-duplicate videos processed (0 = no cap).")
     parser.add_argument("--max-images", type=int, default=0,
-                        help="Test mode: cap number of non-duplicate images processed.")
+                        help="Cap number of non-duplicate images processed (0 = no cap).")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -307,9 +311,8 @@ def main() -> None:
 
     non_dup_df = manifest_df[~manifest_df["is_duplicate"].map(_is_truthy)].copy()
     n_dup = len(manifest_df) - len(non_dup_df)
-    test_mode = args.max_videos > 0 or args.max_images > 0
-    if test_mode:
-        non_dup_df = _truncate_for_testing(manifest_df, args.max_videos, args.max_images)
+    if args.max_videos > 0 or args.max_images > 0:
+        non_dup_df = _apply_limits(manifest_df, args.max_videos, args.max_images)
 
     non_dup_df = non_dup_df.sort_values("size_bytes")
 
@@ -347,11 +350,9 @@ def main() -> None:
             rejection_stats[k] = rejection_stats.get(k, 0) + int(v)
         status = "done"
         fresh_keepers.extend(keepers)
-        # Don't write status rows when test-truncating, so a real run will redo them.
-        if not test_mode:
-            _append_status(
-                status_path, str(row["file_path"]), status, len(keepers), elapsed,
-            )
+        _append_status(
+            status_path, str(row["file_path"]), status, len(keepers), elapsed,
+        )
         logger.info(
             "%s -> %d keeper(s) in %.1fs",
             Path(row["file_path"]).name, len(keepers), elapsed,
@@ -359,7 +360,7 @@ def main() -> None:
 
     # Load prior keepers from results.parquet so cross-file dedup sees them too.
     prior_keepers: list[dict] = []
-    if not args.rescan and not test_mode and results_path.exists():
+    if not args.rescan and results_path.exists():
         prior_df = pd.read_parquet(results_path)
         processed_paths = set(to_process_df["file_path"].astype(str).tolist())
         prior_df = prior_df[~prior_df["video_path"].astype(str).isin(processed_paths)]
@@ -376,11 +377,8 @@ def main() -> None:
     capped_survivors, videos_capped = _apply_video_cap(survivors, args.max_per_video)
     keepers_after_video_cap = len(capped_survivors)
 
-    # In test mode, write to side files so we don't poison the production outputs.
-    parquet_out = output_dir / ("results_test.parquet" if test_mode else "results.parquet")
-    summary_path = output_dir / (
-        "pipeline_summary_test.json" if test_mode else "pipeline_summary.json"
-    )
+    parquet_out = output_dir / "results.parquet"
+    summary_path = output_dir / "pipeline_summary.json"
     # date_source is tracked per keeper for the summary breakdown but not stored
     # in parquet — old parquets won't have it on reload anyway.
     date_source_counts: dict[str, int] = {
@@ -465,7 +463,7 @@ def main() -> None:
     print("───────────────────────────────────────")
     _print_stage_timing_table(stage_times_block, stage_times_pct)
 
-    if not test_mode and parquet_out.exists():
+    if parquet_out.exists():
         _build_viewers(args.config)
 
 
