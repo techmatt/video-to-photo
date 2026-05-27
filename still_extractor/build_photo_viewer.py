@@ -2782,12 +2782,14 @@ def main() -> None:
     df = pd.read_parquet(args.results)
     logger.info("Loaded %d rows from %s", len(df), args.results)
 
-    missing_date_cols = [c for c in ("source_year", "source_month") if c not in df.columns]
-    if missing_date_cols:
-        raise ValueError(
-            "results.parquet is missing source_year/source_month columns. "
-            "Re-run the pipeline to generate updated results.",
-        )
+    for col in ("source_year", "source_month"):
+        if col not in df.columns:
+            logger.warning(
+                "results.parquet is missing '%s' (pre-schema parquet); "
+                "affected rows will appear in the 'Unknown' section.",
+                col,
+            )
+            df[col] = pd.NA
 
     clusters_path: Path | None = None
     if cfg is not None:
@@ -2905,8 +2907,8 @@ def main() -> None:
             w_nat, h_nat,
         ))
 
-        year = int(row["source_year"])
-        month = int(row["source_month"])
+        year = _opt_int(row.get("source_year")) or 0
+        month = _opt_int(row.get("source_month")) or 0
         card_html = _build_card(
             row, thumb_src, export_path, rotation, is_image_source,
             frame_idx, year, month, ckey, identities, has_unknown,
