@@ -1,9 +1,10 @@
 """Score multiple face-quality classifier checkpoints on the same val split.
 
-Reproduces the train/val split used by ``train_classifier`` (same labels store,
-same StratifiedShuffleSplit seed and test_size), then evaluates each provided
-checkpoint on the held-out val set. Prints a per-checkpoint confusion matrix
-and per-class precision/recall/F1, plus a final side-by-side summary.
+The val split is the frozen ``is_val=true`` subset of ``--labels-store``
+(written one-time by the v11 prep step), so every checkpoint is scored on
+exactly the same held-out entries regardless of how the label store grows.
+Prints a per-checkpoint confusion matrix and per-class precision/recall/F1,
+plus a final side-by-side summary.
 
 By default, auto-discovers all ``best_model_v*.pt`` files under
 ``--checkpoint-dir`` (default ``models/face_quality/``) so new versions are
@@ -15,6 +16,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import re
 from pathlib import Path
@@ -37,7 +39,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import precision_recall_fscore_support
-from sklearn.model_selection import StratifiedShuffleSplit
 from torch.utils.data import DataLoader
 
 from still_extractor.constants import FACE_QUALITY_LABELS
@@ -45,11 +46,28 @@ from still_extractor.constants import FACE_QUALITY_LABELS
 logger = logging.getLogger(__name__)
 
 
+_DASH = "-"
+
+
+def _load_sidecar(ckpt_path: Path) -> dict:
+    """Return the sidecar JSON next to a checkpoint, or {} if absent/invalid."""
+    sidecar_path = ckpt_path.with_suffix(".json")
+    if not sidecar_path.exists():
+        return {}
+    try:
+        return json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to read sidecar %s: %s", sidecar_path, e)
+        return {}
+
+
 def _eval_checkpoint(
     ckpt_path: Path, val_loader: DataLoader, device: torch.device,
 ) -> dict:
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model = _build_model().to(device)
+    sidecar = _load_sidecar(ckpt_path)
+    arch = sidecar.get("arch") or state.get("arch") or "mobilenet_v3_small"
+    model = _build_model(arch).to(device)
     model.load_state_dict(state["model_state"])
     val_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
@@ -83,6 +101,10 @@ def _eval_checkpoint(
         "support": support,
         "y_true": y_true,
         "y_pred": y_pred,
+        "codename": sidecar.get("codename") or state.get("codename") or _DASH,
+        "arch": arch if sidecar.get("arch") or state.get("arch") else _DASH,
+        "save_policy": sidecar.get("checkpoint_save_policy") or _DASH,
+        "notes": sidecar.get("notes") or "",
     }
 
 
@@ -98,26 +120,26 @@ def main() -> None:
                         default=Path("models/face_quality"),
                         help="Directory scanned for best_model_v*.pt when "
                              "--checkpoints is not provided.")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Must match the seed used by train_classifier "
-                             "to reproduce the same val split.")
-    parser.add_argument("--test-size", type=float, default=0.1)
     parser.add_argument("--batch-size", type=int, default=32)
     args = parser.parse_args()
 
     if args.checkpoints is None:
-        pattern = re.compile(r"best_model_v(\d+)\.pt$", re.IGNORECASE)
-        discovered: list[tuple[int, Path]] = []
+        # Match both legacy `best_model_v8.pt` and codename-tagged
+        # `best_model_v8_iron_sparrow.pt` filenames.
+        pattern = re.compile(
+            r"best_model_v(\d+)(?:_[a-z][a-z_]*)?\.pt$", re.IGNORECASE,
+        )
+        discovered: list[tuple[int, str, Path]] = []
         for p in args.checkpoint_dir.glob("best_model_v*.pt"):
             m = pattern.search(p.name)
             if m:
-                discovered.append((int(m.group(1)), p))
+                discovered.append((int(m.group(1)), p.name, p))
         if not discovered:
             raise SystemExit(
                 f"No best_model_v*.pt checkpoints found under {args.checkpoint_dir}",
             )
-        discovered.sort(key=lambda t: t[0])
-        args.checkpoints = [p for _, p in discovered]
+        discovered.sort(key=lambda t: (t[0], t[1]))
+        args.checkpoints = [p for _, _, p in discovered]
 
     logging.basicConfig(
         level=logging.INFO,
@@ -130,21 +152,21 @@ def main() -> None:
 
     items = _load_labels_store(args.labels_store)
     if len(items) < N_CLASSES * 2:
-        raise SystemExit("Not enough labeled rows for stratified split.")
-    item_labels = [lbl for _, lbl in items]
-    splitter = StratifiedShuffleSplit(
-        n_splits=1, test_size=args.test_size, random_state=args.seed,
-    )
-    _, val_pos = next(splitter.split(np.zeros(len(items)), item_labels))
-    val_items = [items[i] for i in val_pos]
+        raise SystemExit("Not enough labeled rows to evaluate.")
+    val_items = [(p, l) for p, l, is_val in items if is_val]
+    if not val_items:
+        raise SystemExit(
+            f"No is_val=true entries in {args.labels_store}; freeze the val "
+            f"set first (see docs/prompt_v11_freeze_val.md).",
+        )
     val_labels = [lbl for _, lbl in val_items]
 
     counts = [0] * N_CLASSES
     for y in val_labels:
         counts[y] += 1
     print(
-        f"Val set: {len(val_items)} samples (seed={args.seed}, "
-        f"test_size={args.test_size}); class counts: "
+        f"Val set: {len(val_items)} fixed entries (is_val=true); "
+        f"class counts: "
         f"{ {IDX_TO_LABEL[c]: counts[c] for c in range(N_CLASSES)} }",
     )
 
@@ -172,14 +194,19 @@ def main() -> None:
 
     print(f"\n{'=' * 72}\nSummary\n{'=' * 72}")
     name_w = max(len(Path(r["path"]).name) for r in results) + 2
+    codename_w = max([len(str(r["codename"])) for r in results] + [len("codename")]) + 2
+    arch_w = max([len(str(r["arch"])) for r in results] + [len("arch")]) + 2
     print(
-        f"{'checkpoint':<{name_w}} {'epoch':>6} {'val_loss':>9} "
+        f"{'checkpoint':<{name_w}} {'codename':<{codename_w}} "
+        f"{'arch':<{arch_w}} {'epoch':>6} {'val_loss':>9} "
         f"{'val_acc':>8} {'macro_f1':>9}"
     )
     for r in results:
         macro_f1 = float(np.mean(r["f1"]))
         print(
-            f"{Path(r['path']).name:<{name_w}} {str(r['ckpt_epoch']):>6} "
+            f"{Path(r['path']).name:<{name_w}} "
+            f"{str(r['codename']):<{codename_w}} "
+            f"{str(r['arch']):<{arch_w}} {str(r['ckpt_epoch']):>6} "
             f"{r['val_loss']:>9.4f} {r['val_acc']:>8.3f} {macro_f1:>9.3f}"
         )
 

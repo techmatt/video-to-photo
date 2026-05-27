@@ -12,6 +12,7 @@ dependencies = [
     "onnxruntime-gpu",
     "aesthetic-predictor-v2-5",
     "open_clip_torch",
+    "timm",
     "opencv-python",
     "imagehash",
     "pandas",

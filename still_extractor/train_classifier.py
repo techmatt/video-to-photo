@@ -11,15 +11,18 @@ test-time augmentation, and writes soft labels to CSV.
 """
 
 import argparse
+import datetime as _dt
 import io
 import json
 import logging
 import random
+import re
 import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,7 +30,6 @@ import torchvision.models as models
 import torchvision.transforms as T
 from PIL import Image
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, precision_score
-from sklearn.model_selection import StratifiedShuffleSplit
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
@@ -59,6 +61,49 @@ MIXUP_ALPHA_GOOD_PAIR: float = 0.5
 SAMPLER_BOOST: dict[str, float] = {
     "none": 1.0, "bad": 1.0, "okay": 1.0, "good": 1.25,
 }
+
+ARCH_CHOICES: tuple[str, ...] = ("mobilenet_v3_small", "efficientnet_b0")
+
+# Two-word codename pool for tagging runs. Kept intentionally tame (colors,
+# materials, nature, animals) so checkpoint filenames stay legible.
+_CODENAME_ADJECTIVES: tuple[str, ...] = (
+    "iron", "cobalt", "silver", "amber", "jade", "copper", "ashen", "slate",
+    "onyx", "crimson", "cerulean", "sable", "tawny", "russet", "gilt", "ivory",
+    "obsidian", "azure", "scarlet", "viridian", "maroon", "opal", "flint",
+    "hazel", "umber", "coral", "lichen", "pewter", "dusk", "ember",
+)
+_CODENAME_NOUNS: tuple[str, ...] = (
+    "sparrow", "reef", "mesa", "anvil", "cedar", "shoal", "crest", "flint",
+    "beacon", "prism", "ridge", "haven", "glyph", "forge", "delta", "spire",
+    "lantern", "cairn", "basalt", "hollow", "mantle", "summit", "larch",
+    "cirque", "grotto", "ledge", "solstice", "canopy", "comet", "fern",
+)
+
+
+def generate_codename() -> str:
+    """Return a fresh `adjective_noun` codename. Reseeds Python's global RNG
+    from OS entropy first so the choice is independent of any prior seeding."""
+    random.seed()
+    return f"{random.choice(_CODENAME_ADJECTIVES)}_{random.choice(_CODENAME_NOUNS)}"
+
+
+def _resolve_output_path(
+    output: Path | None, output_dir: Path, codename: str,
+) -> Path:
+    """Resolve the best-checkpoint path, auto-inserting the codename when the
+    stem looks like a bare version tag (e.g. ``best_model_v8.pt``)."""
+    if output is None:
+        return output_dir / f"best_model_{codename}.pt"
+    stem = output.stem
+    if re.search(r"_v\d+$", stem) or stem in ("best_model",):
+        return output.with_name(f"{stem}_{codename}{output.suffix}")
+    return output
+
+
+def _parse_version_tag(path: Path) -> str:
+    """Extract ``v<N>`` from a checkpoint stem like ``best_model_v8_iron_sparrow``."""
+    m = re.search(r"_v(\d+)(?:_|$)", path.stem)
+    return f"v{m.group(1)}" if m else "unknown"
 
 
 class JpegRecompress:
@@ -184,16 +229,23 @@ def _resolve_crop_path(raw_path: str, labels_store: Path) -> Path:
     return labels_store.parent.parent / p
 
 
-def _load_labels_store(labels_store: Path) -> list[tuple[Path, int]]:
+def _load_labels_store(labels_store: Path) -> list[tuple[Path, int, bool]]:
+    """Load the labels store as ``(crop_path, label_idx, is_val)`` tuples.
+
+    Entries missing the ``is_val`` field are treated as ``is_val=False``
+    (train-only) for forward compatibility with future labels added before the
+    next freeze; a warning is emitted with the count.
+    """
     raw = json.loads(labels_store.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise SystemExit(
             f"Expected JSON list at top level of {labels_store}, "
             f"got {type(raw).__name__}",
         )
-    items: list[tuple[Path, int]] = []
+    items: list[tuple[Path, int, bool]] = []
     missing_file = 0
     invalid_label = 0
+    missing_is_val = 0
     for entry in raw:
         label_str = str(entry.get("label", "")).lower()
         if label_str not in LABEL_TO_IDX:
@@ -203,7 +255,12 @@ def _load_labels_store(labels_store: Path) -> list[tuple[Path, int]]:
         if not crop_path.exists():
             missing_file += 1
             continue
-        items.append((crop_path, LABEL_TO_IDX[label_str]))
+        if "is_val" in entry:
+            is_val = bool(entry["is_val"])
+        else:
+            missing_is_val += 1
+            is_val = False
+        items.append((crop_path, LABEL_TO_IDX[label_str], is_val))
     if missing_file:
         logger.warning(
             "%d/%d labels skipped: face_crop_path does not exist on disk",
@@ -213,6 +270,11 @@ def _load_labels_store(labels_store: Path) -> list[tuple[Path, int]]:
         logger.warning(
             "%d/%d labels skipped: label not in %s",
             invalid_label, len(raw), list(LABEL_TO_IDX.keys()),
+        )
+    if missing_is_val:
+        logger.warning(
+            "%d/%d labels missing is_val field; treating as train-only.",
+            missing_is_val, len(raw),
         )
     return items
 
@@ -377,27 +439,42 @@ def mixup_batch(
     return x_mix, y_mix
 
 
-def _build_model() -> nn.Module:
-    backbone = models.mobilenet_v3_small(
-        weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1,
-    )
-    in_features = backbone.classifier[3].in_features
-    backbone.classifier[3] = nn.Linear(in_features, N_CLASSES)
-    return backbone
+def _build_model(arch: str = "mobilenet_v3_small") -> nn.Module:
+    if arch == "mobilenet_v3_small":
+        backbone = models.mobilenet_v3_small(
+            weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1,
+        )
+        in_features = backbone.classifier[3].in_features
+        backbone.classifier[3] = nn.Linear(in_features, N_CLASSES)
+        return backbone
+    if arch == "efficientnet_b0":
+        return timm.create_model(
+            "efficientnet_b0", pretrained=True, num_classes=N_CLASSES,
+        )
+    raise ValueError(f"Unknown arch {arch!r} (choices: {ARCH_CHOICES})")
 
 
-def _apply_phase(model: nn.Module, phase: int) -> None:
+def _apply_phase(model: nn.Module, phase: int, arch: str = "mobilenet_v3_small") -> None:
     """Freeze/unfreeze parameters according to the training phase."""
     if phase == 1:
         for name, param in model.named_parameters():
             param.requires_grad = "classifier" in name
     elif phase == 2:
-        for name, param in model.named_parameters():
-            param.requires_grad = (
-                "features.12" in name
-                or "features.13" in name
-                or "classifier" in name
-            )
+        if arch == "mobilenet_v3_small":
+            for name, param in model.named_parameters():
+                param.requires_grad = (
+                    "features.12" in name
+                    or "features.13" in name
+                    or "classifier" in name
+                )
+        elif arch == "efficientnet_b0":
+            for name, param in model.named_parameters():
+                param.requires_grad = (
+                    name.startswith("blocks.6")
+                    or name.startswith("classifier")
+                )
+        else:
+            raise ValueError(f"Unknown arch {arch!r}")
     else:
         raise ValueError(f"Unknown phase {phase}")
     trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
@@ -456,7 +533,7 @@ def train_one_epoch(
 def evaluate(
     model: nn.Module, loader: DataLoader, device: torch.device,
     criterion: nn.Module,
-) -> tuple[float, float, list[float], list[float], list[float]]:
+) -> tuple[float, float, list[float], list[float], list[float], list[float]]:
     model.eval()
     total_loss = 0.0
     n_seen = 0
@@ -483,12 +560,13 @@ def evaluate(
         per_class_acc.append(
             float((y_pred[mask] == c).sum()) / n if n > 0 else float("nan"),
         )
-    prec, _, f1, _ = precision_recall_fscore_support(
+    prec, rec, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=list(range(N_CLASSES)), zero_division=0,
     )
     return (
         val_loss, val_acc, per_class_acc,
         [float(v) for v in f1], [float(v) for v in prec],
+        [float(v) for v in rec],
     )
 
 
@@ -614,10 +692,10 @@ def main() -> None:
              f"(default: {SAMPLER_BOOST['good']})",
     )
     parser.add_argument(
-        "--select-by", default="val_loss", choices=["val_loss", "p_good"],
-        help="Metric used to pick the best checkpoint and drive early-stop "
-             "patience. 'val_loss' minimizes loss (default); 'p_good' "
-             "maximizes Good precision.",
+        "--arch", default="mobilenet_v3_small", choices=list(ARCH_CHOICES),
+        help="Backbone architecture. 'mobilenet_v3_small' (default) is the "
+             "original lightweight model; 'efficientnet_b0' uses timm's "
+             "ImageNet-pretrained EfficientNet-B0 with the same 128x128 input.",
     )
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -640,6 +718,9 @@ def main() -> None:
         if args.results is None:
             args.results = cfg.output_dir / "results.parquet"
 
+    codename = generate_codename()
+    logger.info("Codename: %s", codename)
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -653,18 +734,25 @@ def main() -> None:
     items = _load_labels_store(args.labels_store)
     if len(items) < N_CLASSES * 2:
         raise SystemExit("Not enough labeled rows for stratified train/val split.")
-    item_labels = [lbl for _, lbl in items]
+    item_labels = [lbl for _, lbl, _ in items]
     logger.info(
         "Loaded %d labeled crops from %s; class counts: %s",
         len(items), args.labels_store, _format_counts(item_labels),
     )
 
-    splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=args.seed)
-    train_pos, val_pos = next(splitter.split(np.zeros(len(items)), item_labels))
-    train_items = [items[i] for i in train_pos]
-    val_items = [items[i] for i in val_pos]
+    train_items = [(p, l) for p, l, is_val in items if not is_val]
+    val_items = [(p, l) for p, l, is_val in items if is_val]
     train_labels = [lbl for _, lbl in train_items]
     val_labels = [lbl for _, lbl in val_items]
+    print(
+        f"Val set: {len(val_items)} fixed entries (is_val=true)",
+        flush=True,
+    )
+    print(
+        f"Train set: {len(train_items)} entries "
+        f"(is_val=false, before synthetic augmentation)",
+        flush=True,
+    )
     logger.info("Train class counts: %s", _format_counts(train_labels))
     logger.info("Val   class counts: %s", _format_counts(val_labels))
 
@@ -720,27 +808,23 @@ def main() -> None:
         val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0,
     )
 
-    model = _build_model().to(device)
-    _apply_phase(model, 1)
+    model = _build_model(args.arch).to(device)
+    _apply_phase(model, 1, args.arch)
     optimizer, scheduler = _make_optimizer(model, args.lr, args.epochs, start_epoch=0)
     val_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     phase1_end = args.epochs // 2
     phase2_start = phase1_end + 1
-    select_maximize = args.select_by == "p_good"
-    best_score = float("-inf") if select_maximize else float("inf")
+    best_p_good = float("-inf")
     best_epoch = 0
-    best_path = args.output if args.output is not None else args.output_dir / "best_model.pt"
+    best_val_metrics: dict[str, float | int] = {}
+    best_path = _resolve_output_path(args.output, args.output_dir, codename)
     best_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info(
-        "Best checkpoint will be saved to %s (selecting by %s, %s)",
-        best_path, args.select_by,
-        "maximize" if select_maximize else "minimize",
+        "Best checkpoint will be saved to %s (selecting by p_good_max)",
+        best_path,
     )
     log_rows: list[dict] = []
-
-    def _is_better(new: float, ref: float) -> bool:
-        return new > ref if select_maximize else new < ref
 
     header = (
         f"{'epoch':>5} {'ph':>2} {'lr':>9} "
@@ -766,9 +850,10 @@ def main() -> None:
             "Epoch %d: resampled %d synthetic none crops", epoch, len(crops),
         )
 
-    def _run_epoch(epoch: int, phase: int) -> tuple[float, float, float]:
+    def _run_epoch(epoch: int, phase: int) -> dict[str, float]:
         tr_loss = train_one_epoch(model, train_loader, optimizer, device)
-        val_loss, val_acc, per_class_acc, per_class_f1, per_class_prec = evaluate(
+        (val_loss, val_acc, per_class_acc, per_class_f1,
+         per_class_prec, per_class_rec) = evaluate(
             model, val_loader, device, val_criterion,
         )
         scheduler.step()
@@ -779,8 +864,8 @@ def main() -> None:
         )
         good_f1 = per_class_f1[good_idx]
         good_prec = per_class_prec[good_idx]
-        cur_score = good_prec if select_maximize else val_loss
-        marker = "  [best]" if phase == 2 and _is_better(cur_score, best_score) else ""
+        good_rec = per_class_rec[good_idx]
+        marker = "  [best]" if phase == 2 and good_prec > best_p_good else ""
         print(
             f"{epoch:>5d} {phase:>2d} {cur_lr:>9.2e} "
             f"{tr_loss:>9.4f} {val_loss:>9.4f} {val_acc:>8.3f} "
@@ -801,7 +886,15 @@ def main() -> None:
             **{f"f1_{IDX_TO_LABEL[c]}": per_class_f1[c] for c in range(N_CLASSES)},
             **{f"p_{IDX_TO_LABEL[c]}": per_class_prec[c] for c in range(N_CLASSES)},
         })
-        return tr_loss, val_loss, good_prec
+        return {
+            "tr_loss": tr_loss,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "good_f1": good_f1,
+            "good_precision": good_prec,
+            "good_recall": good_rec,
+            "macro_f1": float(np.mean(per_class_f1)),
+        }
 
     logger.info("=== Phase 1: training head only (epochs 1-%d) ===", phase1_end)
     for epoch in range(1, phase1_end + 1):
@@ -812,42 +905,88 @@ def main() -> None:
         "=== Phase 2: unfreezing last conv block (epochs %d-%d) ===",
         phase2_start, args.epochs,
     )
-    _apply_phase(model, 2)
+    _apply_phase(model, 2, args.arch)
     optimizer, scheduler = _make_optimizer(
         model, args.lr, args.epochs, start_epoch=phase1_end,
     )
-    best_score = float("-inf") if select_maximize else float("inf")
+    best_p_good = float("-inf")
     best_epoch = 0
     patience_left = args.patience
 
     for epoch in range(phase2_start, args.epochs + 1):
         _resample_synth(epoch)
-        _, val_loss, good_prec = _run_epoch(epoch, phase=2)
-        cur_score = good_prec if select_maximize else val_loss
-        if _is_better(cur_score, best_score):
-            best_score = cur_score
+        epoch_metrics = _run_epoch(epoch, phase=2)
+        good_prec = epoch_metrics["good_precision"]
+        if good_prec > best_p_good:
+            best_p_good = good_prec
             best_epoch = epoch
+            best_val_metrics = {"epoch": epoch, **epoch_metrics}
             torch.save(
                 {"model_state": model.state_dict(), "epoch": epoch,
-                 "val_loss": val_loss, "p_good": good_prec,
-                 "select_by": args.select_by},
+                 "val_loss": epoch_metrics["val_loss"], "p_good": good_prec,
+                 "arch": args.arch, "codename": codename,
+                 "select_by": "p_good"},
                 best_path,
+            )
+            logger.info(
+                "New best @ epoch %d: p_good=%.4f (val_loss=%.4f)",
+                epoch, good_prec, epoch_metrics["val_loss"],
             )
             patience_left = args.patience
         else:
             patience_left -= 1
             if patience_left <= 0:
                 logger.info(
-                    "Early stop at epoch %d (best %s=%.4f @ epoch %d)",
-                    epoch, args.select_by, best_score, best_epoch,
+                    "Early stop at epoch %d (best p_good=%.4f @ epoch %d)",
+                    epoch, best_p_good, best_epoch,
                 )
                 break
 
     pd.DataFrame(log_rows).to_csv(args.output_dir / "training_log.csv", index=False)
     logger.info(
-        "Wrote training_log.csv (%d epochs, best %s=%.4f @ epoch %d)",
-        len(log_rows), args.select_by, best_score, best_epoch,
+        "Wrote training_log.csv (%d epochs, best p_good=%.4f @ epoch %d)",
+        len(log_rows), best_p_good, best_epoch,
     )
+
+    sidecar_path = best_path.with_suffix(".json")
+    sidecar = {
+        "codename": codename,
+        "version_tag": _parse_version_tag(best_path),
+        "arch": args.arch,
+        "input_size": DISPLAY_SIZE,
+        "num_classes": N_CLASSES,
+        "label_names": list(FACE_QUALITY_LABELS),
+        "checkpoint_save_policy": "p_good_max",
+        "hyperparams": {
+            "lr": args.lr,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "early_stop_patience": args.patience,
+            "mixup_alpha": MIXUP_ALPHA,
+            "good_good_mixup_beta": MIXUP_ALPHA_GOOD_PAIR,
+            "sampler_boost_good": args.sampler_boost_good,
+            "synthetic_none_ratio": args.synthetic_none_ratio,
+            "optimizer": "AdamW",
+            "scheduler": "CosineAnnealingLR",
+        },
+        "label_counts": {
+            **_format_counts(item_labels),
+            "total": len(item_labels),
+        },
+        "val_metrics_at_save": {
+            "epoch": int(best_val_metrics.get("epoch", best_epoch)),
+            "val_loss": float(best_val_metrics.get("val_loss", float("nan"))),
+            "val_acc": float(best_val_metrics.get("val_acc", float("nan"))),
+            "good_f1": float(best_val_metrics.get("good_f1", float("nan"))),
+            "good_precision": float(best_val_metrics.get("good_precision", best_p_good)),
+            "good_recall": float(best_val_metrics.get("good_recall", float("nan"))),
+            "macro_f1": float(best_val_metrics.get("macro_f1", float("nan"))),
+        },
+        "trained_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "notes": "",
+    }
+    sidecar_path.write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+    logger.info("Wrote sidecar metadata to %s", sidecar_path)
 
     state = torch.load(best_path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state"])
@@ -855,13 +994,10 @@ def main() -> None:
 
     y_true, y_pred = _collect_predictions(model, val_loader, device)
     _print_validation_report(y_true, y_pred)
-    p_good_str = (
-        f", p_good={float(state['p_good']):.4f}" if "p_good" in state else ""
-    )
     print(
         f"\nBest checkpoint: epoch {state['epoch']}, "
-        f"val_loss={float(state['val_loss']):.4f}{p_good_str} "
-        f"(selected by {args.select_by})",
+        f"val_loss={float(state['val_loss']):.4f}, "
+        f"p_good={float(state['p_good']):.4f} (selected by p_good_max)",
     )
 
     if args.results is None:

@@ -262,6 +262,7 @@ def run_export(
             "face_crop_path": _to_fwd_slash(out_path),
             "sha256": jpeg_sha256,
             "corpus": corpus_name,
+            "is_val": False,
         })
         new_count += 1
 
