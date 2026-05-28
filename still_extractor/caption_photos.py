@@ -43,10 +43,6 @@ PROMPT_STRUCTURED = (
     "\n"
     "setting: [where the photo was taken, e.g. playground, kitchen, beach]\n"
     "activity: [what is happening, e.g. eating, playing, laughing]\n"
-    "people: [count and rough relationship, e.g. one child, two children, "
-    "child and adult, group]\n"
-    "mood: [one word, e.g. joyful, calm, silly, focused, tired]\n"
-    "framing: [close portrait, medium, or wide action]\n"
     "\n"
     "Respond with only the fields above, nothing else."
 )
@@ -64,14 +60,14 @@ PROMPT_AESTHETIC = (
     "to 10. Nothing else."
 )
 
-TEXT_FIELDS = ("setting", "activity", "people", "mood", "framing")
+TEXT_FIELDS = ("setting", "activity")
 # Retained for import-compatibility with caption_photos_overnight.py (historical
 # experiment runner). The new structured prompt no longer emits these fields.
 SCORE_FIELDS = ("lighting", "face_quality", "aesthetic")
 
 CAPTION_COLUMNS_STR = [
-    "caption_setting", "caption_activity", "caption_people", "caption_mood",
-    "caption_framing", "caption_description", "caption_model", "caption_timestamp",
+    "caption_setting", "caption_activity",
+    "caption_description", "caption_model", "caption_timestamp",
 ]
 CAPTION_COLUMNS_INT = [
     "caption_aesthetic_score",
@@ -229,16 +225,28 @@ def run_prompt_batch(
 # Selection + I/O
 # ---------------------------------------------------------------------------
 
+def _representative_mask(df: pd.DataFrame) -> pd.Series:
+    """True for representative frames (or all rows if the column is absent)."""
+    if "is_group_representative" not in df.columns:
+        return pd.Series(True, index=df.index)
+    return df["is_group_representative"].fillna(True).astype(bool)
+
+
 def select_rows(
     df: pd.DataFrame, min_quality: str, force: bool, max_images: int | None,
 ) -> tuple[pd.Index, int]:
     """Return (selected_row_indices, n_already_captioned_in_filter).
 
-    Selected rows are kept_path-present, pred_label in the allowed set, and
-    (unless force) lack a non-null caption_setting.
+    Selected rows are kept_path-present, pred_label in the allowed set,
+    representative (per is_group_representative), and (unless force) lack a
+    non-null caption_setting.
     """
     allowed = MIN_QUALITY_ALLOWED[min_quality]
-    base_mask = df["kept_path"].notna() & df["pred_label"].isin(allowed)
+    base_mask = (
+        df["kept_path"].notna()
+        & df["pred_label"].isin(allowed)
+        & _representative_mask(df)
+    )
 
     n_already = 0
     if "caption_setting" in df.columns:
@@ -296,9 +304,6 @@ def print_summary(
     coverage_specs = [
         ("setting", "caption_setting"),
         ("activity", "caption_activity"),
-        ("people", "caption_people"),
-        ("mood", "caption_mood"),
-        ("framing", "caption_framing"),
         ("aesthetic_score", "caption_aesthetic_score"),
         ("description", "caption_description"),
     ]
@@ -331,7 +336,7 @@ def print_summary(
         kp = row.get("kept_path") or ""
         print(f"  - {Path(str(kp)).name}")
         print(f"      setting: {row.get('caption_setting')}")
-        print(f"      mood:    {row.get('caption_mood')}")
+        print(f"      activity: {row.get('caption_activity')}")
         print(f"      aesthetic: {row.get('caption_aesthetic_score')}")
         desc = row.get("caption_description")
         if isinstance(desc, str) and desc:
@@ -379,11 +384,20 @@ def caption_run(
     df = pd.read_parquet(results_path)
     ensure_caption_columns(df)
 
+    if "is_group_representative" not in df.columns:
+        logger.warning(
+            "similarity_group_id column not found - captioning all quality-filtered frames"
+        )
+
     selected_idx, n_already = select_rows(df, min_quality, force, max_images)
     n_to_caption = len(selected_idx)
 
     n_in_filter = int(
-        (df["kept_path"].notna() & df["pred_label"].isin(MIN_QUALITY_ALLOWED[min_quality])).sum()
+        (
+            df["kept_path"].notna()
+            & df["pred_label"].isin(MIN_QUALITY_ALLOWED[min_quality])
+            & _representative_mask(df)
+        ).sum()
     )
     print(f"Captioning {n_to_caption} images "
           f"(pred_label in {sorted(MIN_QUALITY_ALLOWED[min_quality])}, "
@@ -492,9 +506,9 @@ def caption_run(
                                df.at[row_i, "kept_path"], struct_text[:200])
             df.at[row_i, "caption_setting"] = parsed["setting"]
             df.at[row_i, "caption_activity"] = parsed["activity"]
-            df.at[row_i, "caption_people"] = parsed["people"]
-            df.at[row_i, "caption_mood"] = parsed["mood"]
-            df.at[row_i, "caption_framing"] = parsed["framing"]
+            for legacy_col in ("caption_people", "caption_mood", "caption_framing"):
+                if legacy_col in df.columns:
+                    df.at[row_i, legacy_col] = None
             aes_score = parse_aesthetic_score(aes_text or "")
             if aes_score is None:
                 logger.warning("No digit in aesthetic output for %s: %r",

@@ -26,6 +26,18 @@ from still_extractor.constants import (
     card_key,
 )
 from still_extractor.inventory import RunConfig
+from still_extractor.score_frames import (
+    DEFAULT_THRESHOLDS,
+    FACE_SLOTS,
+    WEIGHT_AESTHETIC,
+    WEIGHT_AREA,
+    WEIGHT_FACE,
+    Thresholds,
+    _area_frac,
+    _compute_face_q,
+    _f as _score_f,
+    _face_score,
+)
 from still_extractor.utils import (
     parse_kps as _parse_kps,
     safe_float as _safe_float,
@@ -94,6 +106,69 @@ def _opt_bool(val) -> bool | None:
     if isinstance(val, float) and pd.isna(val):
         return None
     return bool(val)
+
+
+def _opt_str(val) -> str | None:
+    if val is None:
+        return None
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    s = str(val)
+    return s if s else None
+
+
+def _quality_payload(row: pd.Series) -> dict | None:
+    """Recompute the score_frames breakdown for one row.
+
+    Returns None when quality_score is missing (score_frames not yet run for
+    this row). Always uses the same WEIGHT_FACE/AESTHETIC/AREA recipe and
+    face-q soft-max-with-bonus as `score_frames.compute_quality_score` so the
+    viewer breakdown matches the stored score.
+    """
+    qs_raw = row.get("quality_score")
+    if qs_raw is None or (isinstance(qs_raw, float) and pd.isna(qs_raw)):
+        return None
+    try:
+        quality_score = float(qs_raw)
+    except (TypeError, ValueError):
+        return None
+
+    aesthetic = _score_f(row.get("aesthetics_norm")) or 0.0
+    aesthetic = max(0.0, min(1.0, aesthetic))
+
+    per_face: list[tuple[float, int]] = []
+    for idx, (okay_col, good_col, *_) in enumerate(FACE_SLOTS):
+        s = _face_score(_score_f(row.get(okay_col)), _score_f(row.get(good_col)))
+        if s is not None:
+            per_face.append((max(0.0, min(1.0, s)), idx))
+
+    if per_face:
+        per_face.sort(key=lambda t: t[0], reverse=True)
+        face_q = _compute_face_q([s for s, _ in per_face])
+        best_slot = per_face[0][1]
+        x1c, y1c, x2c, y2c = FACE_SLOTS[best_slot][2:]
+        area = _area_frac(
+            _score_f(row.get(x1c)), _score_f(row.get(y1c)),
+            _score_f(row.get(x2c)), _score_f(row.get(y2c)),
+            _score_f(row.get("frame_w")), _score_f(row.get("frame_h")),
+        ) or 0.0
+        is_zero_face = False
+    else:
+        face_q = 0.0
+        area = 0.0
+        is_zero_face = True
+
+    face_count = _opt_int(row.get("face_count")) or 0
+
+    return {
+        "quality_score": round(quality_score, 3),
+        "quality_bucket": _opt_str(row.get("quality_bucket")),
+        "face_q": round(face_q, 3),
+        "aesthetic_norm": round(aesthetic, 3),
+        "largest_face_area_frac": round(area, 3),
+        "face_count": face_count,
+        "is_zero_face": bool(is_zero_face),
+    }
 
 
 def _section_key(year: int, month: int) -> str:
@@ -406,6 +481,9 @@ def _build_frame_json(
     has_embedding_cols: bool,
     natural_w: int,
     natural_h: int,
+    similarity_group_id: int | None,
+    is_group_representative: bool,
+    similarity_group_size: int,
 ) -> dict:
     f = _safe_float
     up_deg = _opt_int(row.get("uprighter_pred")) or 0
@@ -446,6 +524,10 @@ def _build_frame_json(
         "refined_timestamp_s": f(row.get("refined_timestamp_s")),
         "uprighter_pred": up_str,
         "uprighter_confidence": up_conf if up_str is not None else None,
+        "quality": _quality_payload(row),
+        "similarity_group_id": similarity_group_id,
+        "is_group_representative": bool(is_group_representative),
+        "similarity_group_size": int(similarity_group_size),
     }
 
 
@@ -475,6 +557,9 @@ def _build_card(
     ckey: str,
     identities: list[str],
     has_unknown: bool,
+    similarity_group_id: int | None,
+    is_group_representative: bool,
+    similarity_group_size: int,
 ) -> str:
     pred_raw = row.get("pred_label")
     pred_label = (
@@ -486,20 +571,43 @@ def _build_card(
     source_type = "image" if is_image_source else "video"
     badge_html = "" if is_image_source else VIDEO_BADGE_HTML
     identities_attr = "|".join(identities)
+    bucket_attr = _opt_str(row.get("quality_bucket")) or ""
 
-    return f"""<div class="photo-card"
+    nonrep_class = "" if is_group_representative else " non-representative"
+    rep_attr = "true" if is_group_representative else "false"
+    group_id_attr = str(similarity_group_id) if similarity_group_id is not None else ""
+    if is_group_representative and similarity_group_size >= 2:
+        similar_badge_html = (
+            f'<div class="similar-badge similar-badge-rep" '
+            f'title="{similarity_group_size} near-duplicate frames in this group">'
+            f'{similarity_group_size} similar</div>'
+        )
+    elif not is_group_representative:
+        similar_badge_html = (
+            '<div class="similar-badge similar-badge-dup" '
+            'title="Near-duplicate of representative frame in this group">similar</div>'
+        )
+    else:
+        similar_badge_html = ""
+
+    return f"""<div class="photo-card{nonrep_class}"
      data-card-key="{html.escape(ckey)}"
      data-frame-idx="{frame_idx}"
      data-export-path="{html.escape(export_path)}"
      data-source-type="{source_type}"
      data-quality="{html.escape(pred_label)}"
+     data-quality-bucket="{html.escape(bucket_attr)}"
      data-year="{year}"
      data-month="{month}"
      data-rotation="{rotation}"
      data-video-stem="{html.escape(video_stem)}"
      data-identities="{html.escape(identities_attr)}"
-     data-has-unknown="{'true' if has_unknown else 'false'}">
+     data-has-unknown="{'true' if has_unknown else 'false'}"
+     data-is-representative="{rep_attr}"
+     data-similarity-group="{group_id_attr}"
+     data-group-size="{similarity_group_size}">
   {badge_html}
+  {similar_badge_html}
   <button class="card-check" aria-label="Select photo" tabindex="-1">
     <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
       <path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z" fill="currentColor"/>
@@ -511,6 +619,7 @@ def _build_card(
     </svg>
   </button>
   <img src="{thumb_src}" loading="lazy" alt="">
+  <div class="quality-breakdown" data-rendered="0"></div>
 </div>"""
 
 
@@ -968,6 +1077,131 @@ header {
   font-weight: 400;
 }
 .identity-chip.active .identity-count { color: var(--chip-selected-text); }
+
+/* Quality bucket filter row */
+.bucket-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 24px 10px 24px;
+  border-top: 1px solid var(--border);
+}
+.bucket-filter-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin-right: 4px;
+}
+.bucket-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--chip-bg);
+  border: none;
+  color: var(--text-secondary);
+  padding: 4px 10px;
+  border-radius: 12px;
+  font: 500 12px/1 'DM Sans', sans-serif;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.bucket-chip:hover { background: #e8eaed; }
+.bucket-chip .bucket-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+.bucket-chip[data-bucket="all"] .bucket-dot { display: none; }
+.bucket-chip[data-bucket="low"] { color: #5f6368; }
+.bucket-chip[data-bucket="medium"] { color: #1a73e8; }
+.bucket-chip[data-bucket="high"] { color: #b5891f; }
+.bucket-chip[data-bucket="great"] { color: #0f9d58; }
+.bucket-chip.active { color: white; }
+.bucket-chip[data-bucket="all"].active { background: #5f6368; }
+.bucket-chip[data-bucket="low"].active { background: #9aa0a6; }
+.bucket-chip[data-bucket="medium"].active { background: #1a73e8; }
+.bucket-chip[data-bucket="high"].active { background: #f4b400; color: #202124; }
+.bucket-chip[data-bucket="great"].active { background: #0f9d58; }
+
+/* Hide-similar toggle (sits in the bucket-filter-row) */
+.similar-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--chip-bg);
+  border: none;
+  color: var(--text-secondary);
+  padding: 4px 10px;
+  border-radius: 12px;
+  font: 500 12px/1 'DM Sans', sans-serif;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  margin-left: 8px;
+}
+.similar-toggle:hover { background: #e8eaed; }
+.similar-toggle.active { background: var(--accent); color: white; }
+.similar-toggle .toggle-icon {
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Per-card similarity badges */
+.similar-badge {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  background: rgba(0,0,0,0.55);
+  color: #fff;
+  font: 500 10px/1 'DM Sans', sans-serif;
+  padding: 3px 7px;
+  border-radius: 10px;
+  pointer-events: none;
+  z-index: 2;
+  letter-spacing: 0.02em;
+}
+.similar-badge-dup {
+  background: rgba(95,99,104,0.85);
+}
+#export-grid .similar-badge { display: none !important; }
+
+/* Subtle visual indicator on non-representative cards (shown when hide-similar
+   is OFF, hidden by display:none when hide-similar is ON via JS). */
+.photo-card.non-representative {
+  outline: 2px dashed rgba(95,99,104,0.55);
+  outline-offset: -4px;
+}
+.photo-card.non-representative img { opacity: 0.85; }
+
+/* Quality breakdown overlay (per-card) */
+.quality-breakdown {
+  display: none;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(15, 18, 24, 0.86);
+  color: #f3f4f6;
+  font: 10px/1.35 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  padding: 6px 8px;
+  white-space: pre;
+  z-index: 4;
+  pointer-events: none;
+  overflow: hidden;
+}
+body.show-quality-breakdown .quality-breakdown { display: block; }
+.quality-breakdown .qb-bucket-low { color: #c8cdd1; }
+.quality-breakdown .qb-bucket-medium { color: #8ab4f8; }
+.quality-breakdown .qb-bucket-high { color: #f4b400; }
+.quality-breakdown .qb-bucket-great { color: #5ad28b; }
+.quality-breakdown .qb-missing { color: #fbbc05; }
 
 /* Settings */
 .settings-toggle {
@@ -1448,6 +1682,7 @@ body.selection-mode .card-check {
 JS_TEMPLATE = """
 const FRAMES_DATA = __FRAMES_DATA__;
 const IDENTITY_PORTRAITS = __IDENTITY_PORTRAITS__;
+const QUALITY_CONFIG = __QUALITY_CONFIG__;
 
 const KEY_SELECTED = 'se_selected';
 const KEY_YEARS_COLLAPSED = 'se_years_collapsed';        // legacy
@@ -1455,12 +1690,16 @@ const KEY_SECTIONS_COLLAPSED = 'se_sections_collapsed';  // new
 const KEY_YEARS_EXPANDED = 'se_years_expanded';
 const KEY_QUALITY_FILTER = 'se_quality_filter';
 const KEY_SOURCE_FILTER = 'se_source_filter';
+const KEY_BUCKET_FILTER = 'se_bucket_filter';
 const KEY_PEOPLE_FILTER = 'se_people_filter';
 const KEY_SHOW_DEBUG = 'se_debug_show_debug';
 const KEY_SHOW_FACES = 'se_debug_show_faces';
+const KEY_SHOW_QUALITY = 'se_debug_show_quality';
 const KEY_SHOW_REJECTED = 'se_debug_show_rejected';
+const KEY_HIDE_SIMILAR = 'se_hide_similar';
 
 const UNKNOWN_CHIP_ID = '__unknown__';
+const BUCKET_NAMES = ['low', 'medium', 'high', 'great'];
 
 // Tunable constants for justified layout.
 const TARGET_ROW_HEIGHT = 200;   // px
@@ -1484,9 +1723,11 @@ let expandedYears = new Set();
 let layout = 'justified';
 let qualityFilter = { good: true, okay: false, bad: false, none: false };
 let sourceFilter = 'all';
+let bucketFilter = new Set();   // empty = "All"; otherwise restrict to these bucket names
 let peopleFilter = { mode: 'AND', identities: [] };
-let debugFlags = { show_debug: false, show_faces: false };
+let debugFlags = { show_debug: false, show_faces: false, show_quality: false };
 let showRejected = false;
+let hideSimilar = false;
 
 let lightboxOrder = [];
 let lightboxIndex = -1;
@@ -1555,9 +1796,17 @@ function loadState() {
         ? p.identities.filter(x => typeof x === 'string') : [];
     }
   } catch (_) {}
+  try {
+    const b = JSON.parse(localStorage.getItem(KEY_BUCKET_FILTER) || '[]');
+    if (Array.isArray(b)) {
+      bucketFilter = new Set(b.filter(x => BUCKET_NAMES.indexOf(x) >= 0));
+    }
+  } catch (_) {}
   debugFlags.show_debug = localStorage.getItem(KEY_SHOW_DEBUG) === 'true';
   debugFlags.show_faces = localStorage.getItem(KEY_SHOW_FACES) === 'true';
+  debugFlags.show_quality = localStorage.getItem(KEY_SHOW_QUALITY) === 'true';
   showRejected = localStorage.getItem(KEY_SHOW_REJECTED) === 'true';
+  hideSimilar = localStorage.getItem(KEY_HIDE_SIMILAR) === 'true';
 }
 
 function saveSelected() { localStorage.setItem(KEY_SELECTED, JSON.stringify(Array.from(selected))); }
@@ -1566,9 +1815,12 @@ function saveExpandedYears() { localStorage.setItem(KEY_YEARS_EXPANDED, JSON.str
 function saveQualityFilter() { localStorage.setItem(KEY_QUALITY_FILTER, JSON.stringify(qualityFilter)); }
 function saveSourceFilter() { localStorage.setItem(KEY_SOURCE_FILTER, sourceFilter); }
 function savePeopleFilter() { localStorage.setItem(KEY_PEOPLE_FILTER, JSON.stringify(peopleFilter)); }
+function saveBucketFilter() { localStorage.setItem(KEY_BUCKET_FILTER, JSON.stringify(Array.from(bucketFilter))); }
+function saveHideSimilar() { localStorage.setItem(KEY_HIDE_SIMILAR, String(hideSimilar)); }
 function saveDebugFlags() {
   localStorage.setItem(KEY_SHOW_DEBUG, String(debugFlags.show_debug));
   localStorage.setItem(KEY_SHOW_FACES, String(debugFlags.show_faces));
+  localStorage.setItem(KEY_SHOW_QUALITY, String(debugFlags.show_quality));
 }
 
 // === Card helpers ===
@@ -1601,7 +1853,22 @@ function passesSource(card) {
   return true;
 }
 
-function passesFilter(card) { return passesQuality(card) && passesPeople(card) && passesSource(card); }
+function passesBucket(card) {
+  if (bucketFilter.size === 0) return true;        // "All"
+  const b = card.dataset.qualityBucket || '';
+  if (!b) return false;                            // bucket unknown -> excluded by specific filters
+  return bucketFilter.has(b);
+}
+
+function passesSimilar(card) {
+  if (!hideSimilar) return true;
+  return card.dataset.isRepresentative !== 'false';
+}
+
+function passesFilter(card) {
+  return passesQuality(card) && passesPeople(card) && passesSource(card)
+    && passesBucket(card) && passesSimilar(card);
+}
 
 // === Apply filters & counts ===
 function applyFilters() {
@@ -1672,6 +1939,47 @@ function visibleCardsInGrid(grid) {
   return out;
 }
 
+// Reorder so each representative is immediately followed by all visible
+// non-representatives from the same similarity group. Representatives' relative
+// order is preserved; pulled-forward non-reps are skipped at their original
+// position. Singletons (no similarity_group_id) are unaffected.
+function clusterBySimilarityGroup(cards) {
+  const followersByGroup = new Map();
+  for (const card of cards) {
+    if (card.dataset.isRepresentative === 'false') {
+      const gid = card.dataset.similarityGroup;
+      if (gid) {
+        let list = followersByGroup.get(gid);
+        if (!list) { list = []; followersByGroup.set(gid, list); }
+        list.push(card);
+      }
+    }
+  }
+  if (followersByGroup.size === 0) return cards;
+
+  const pulled = new Set();
+  const out = [];
+  for (const card of cards) {
+    if (pulled.has(card)) continue;
+    out.push(card);
+    if (card.dataset.isRepresentative === 'true') {
+      const gid = card.dataset.similarityGroup;
+      if (gid) {
+        const followers = followersByGroup.get(gid);
+        if (followers) {
+          for (const f of followers) {
+            if (!pulled.has(f)) {
+              out.push(f);
+              pulled.add(f);
+            }
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
 function cardAspectRatio(card) {
   const frame = currentFrame(card);
   if (frame && frame.w && frame.h && frame.w > 0 && frame.h > 0) {
@@ -1687,7 +1995,7 @@ function cardAspectRatio(card) {
  * Last row is left-aligned at TARGET_ROW_HEIGHT (not stretched).
  */
 function justifySection(grid) {
-  const cards = visibleCardsInGrid(grid);
+  const cards = clusterBySimilarityGroup(visibleCardsInGrid(grid));
   // Tear down any previous row wrappers; we will rebuild.
   grid.querySelectorAll(':scope > .j-row').forEach(r => {
     while (r.firstChild) grid.appendChild(r.firstChild);
@@ -1902,9 +2210,105 @@ function toggleDropdown(name) {
 
 // === Settings / debug ===
 function applyDebugFlags() {
-  ['show_debug', 'show_faces'].forEach(k => {
+  ['show_debug', 'show_faces', 'show_quality'].forEach(k => {
     const cb = document.getElementById('toggle-' + k);
     if (cb) cb.checked = !!debugFlags[k];
+  });
+  document.body.classList.toggle('show-quality-breakdown', !!debugFlags.show_quality);
+  if (debugFlags.show_quality) populateQualityBreakdowns();
+}
+
+// === Bucket filter chips ===
+function applyBucketChipStates() {
+  const allActive = bucketFilter.size === 0;
+  document.querySelectorAll('.bucket-chip').forEach(chip => {
+    const b = chip.dataset.bucket;
+    if (b === 'all') chip.classList.toggle('active', allActive);
+    else chip.classList.toggle('active', bucketFilter.has(b));
+  });
+}
+
+function setBucketFilter(bucket) {
+  if (bucket === 'all') {
+    bucketFilter.clear();
+  } else {
+    if (bucketFilter.has(bucket)) bucketFilter.delete(bucket);
+    else bucketFilter.add(bucket);
+  }
+  saveBucketFilter();
+  applyBucketChipStates();
+  applyFilters();
+}
+
+// === Hide-similar toggle ===
+function applyHideSimilarState() {
+  const btn = document.getElementById('similar-toggle');
+  if (btn) {
+    btn.classList.toggle('active', hideSimilar);
+    const lbl = btn.querySelector('.toggle-label');
+    if (lbl) lbl.textContent = hideSimilar ? 'Showing reps only' : 'Hide similar';
+  }
+}
+
+function toggleHideSimilar() {
+  hideSimilar = !hideSimilar;
+  saveHideSimilar();
+  applyHideSimilarState();
+  applyFilters();
+}
+
+// === Per-card quality breakdown overlay ===
+function fmt3(v) {
+  if (v == null || isNaN(v)) return '  -  ';
+  return Number(v).toFixed(3);
+}
+
+function buildBreakdownHtml(q) {
+  if (!q) {
+    return '<span class="qb-missing">Score: not computed</span>';
+  }
+  const bucket = q.quality_bucket || '?';
+  const bucketCls = 'qb-bucket-' + bucket;
+  const score = fmt3(q.quality_score);
+  const faceQ = fmt3(q.face_q);
+  const aes = fmt3(q.aesthetic_norm);
+  const area = fmt3(q.largest_face_area_frac);
+  const wF = QUALITY_CONFIG.weight_face.toFixed(2);
+  const wA = QUALITY_CONFIG.weight_aesthetic.toFixed(2);
+  const wR = QUALITY_CONFIG.weight_area.toFixed(2);
+  const cap = QUALITY_CONFIG.zero_face_cap.toFixed(2);
+  const cFace = fmt3(q.face_q * QUALITY_CONFIG.weight_face);
+  const cAes = fmt3(q.aesthetic_norm * QUALITY_CONFIG.weight_aesthetic);
+  const cArea = fmt3(q.largest_face_area_frac * QUALITY_CONFIG.weight_area);
+  const faces = q.face_count;
+  const zeroStr = q.is_zero_face ? 'yes' : 'no';
+  const head = 'Quality: ' + score + ' [<span class="' + bucketCls + '">' + bucket + '</span>]\\n';
+  if (q.is_zero_face) {
+    return head
+      + '  aesthetic: ' + aes + ' x ' + cap + ' cap = ' + score + '\\n'
+      + '  (zero-face cap applied)\\n'
+      + '  faces: ' + faces + '  [zero-face: ' + zeroStr + ']';
+  }
+  const rule = '  -----------------------------';
+  return head
+    + '  face_q:    ' + faceQ + ' x ' + wF + ' = ' + cFace + '\\n'
+    + '  aesthetic: ' + aes + ' x ' + wA + ' = ' + cAes + '\\n'
+    + '  area_frac: ' + area + ' x ' + wR + ' = ' + cArea + '\\n'
+    + rule + '\\n'
+    + '  combined:  ' + score + '\\n'
+    + '  faces: ' + faces + '  [zero-face: ' + zeroStr + ']';
+}
+
+function populateQualityBreakdowns() {
+  document.querySelectorAll('.photo-card').forEach(card => {
+    const slot = card.querySelector(':scope > .quality-breakdown');
+    if (!slot) return;
+    if (slot.dataset.rendered === '1') return;
+    const idx = parseInt(card.dataset.frameIdx, 10);
+    const frame = isNaN(idx) ? null : FRAMES_DATA[idx];
+    const q = (frame && frame.quality) || null;
+    slot.innerHTML = buildBreakdownHtml(q);
+    slot.dataset.rendered = '1';
   });
 }
 
@@ -2566,7 +2970,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Settings checkboxes
-  ['show_debug', 'show_faces'].forEach(k => {
+  ['show_debug', 'show_faces', 'show_quality'].forEach(k => {
     const cb = document.getElementById('toggle-' + k);
     if (!cb) return;
     cb.checked = !!debugFlags[k];
@@ -2577,6 +2981,25 @@ document.addEventListener('DOMContentLoaded', () => {
       if (document.getElementById('lightbox').classList.contains('open')) renderLightbox();
     });
   });
+
+  // Bucket-filter chips (only present when quality_score data exists).
+  document.querySelectorAll('.bucket-chip').forEach(chip => {
+    chip.addEventListener('click', e => {
+      e.stopPropagation();
+      setBucketFilter(chip.dataset.bucket);
+    });
+  });
+  applyBucketChipStates();
+
+  // Hide-similar toggle (only present when similarity groups exist).
+  const similarBtn = document.getElementById('similar-toggle');
+  if (similarBtn) {
+    similarBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      toggleHideSimilar();
+    });
+  }
+  applyHideSimilarState();
 
   applyDebugFlags();
 
@@ -2837,6 +3260,13 @@ def main() -> None:
     if "composite" in df.columns:
         df = df.sort_values("composite", ascending=False, kind="mergesort").reset_index(drop=True)
 
+    # Group sizes for the similarity-group badge / hide-similar toggle.
+    group_sizes_by_id: dict[int, int] = {}
+    if "similarity_group_id" in df.columns:
+        counts = df["similarity_group_id"].dropna().astype(int).value_counts()
+        group_sizes_by_id = {int(gid): int(cnt) for gid, cnt in counts.items()}
+    has_similarity_groups = any(s >= 2 for s in group_sizes_by_id.values())
+
     # Frame dimensions sidecar cache (avoid re-reading every image each build).
     cache_path: Path | None = None
     if cfg is not None:
@@ -2900,11 +3330,20 @@ def main() -> None:
                 dims_cache[ckey] = [w_nat, h_nat]
                 dim_reads += 1
 
+        sim_gid = _opt_int(row.get("similarity_group_id"))
+        is_rep_val = row.get("is_group_representative")
+        if is_rep_val is None or (isinstance(is_rep_val, float) and pd.isna(is_rep_val)):
+            is_rep = True
+        else:
+            is_rep = bool(is_rep_val)
+        group_size = group_sizes_by_id.get(sim_gid, 1) if sim_gid is not None else 1
+
         frame_idx = len(frames)
         frames.append(_build_frame_json(
             row, kept_p, is_image_source,
             identities_with_centroids, membership, has_embedding_cols,
             w_nat, h_nat,
+            sim_gid, is_rep, group_size,
         ))
 
         year = _opt_int(row.get("source_year")) or 0
@@ -2912,6 +3351,7 @@ def main() -> None:
         card_html = _build_card(
             row, thumb_src, export_path, rotation, is_image_source,
             frame_idx, year, month, ckey, identities, has_unknown,
+            sim_gid, is_rep, group_size,
         )
         ts_val = row.get("timestamp_s")
         if is_image_source or pd.isna(ts_val):
@@ -3006,12 +3446,35 @@ def main() -> None:
     # Hide People dropdown trigger if no face filter data exists.
     show_people_dropdown = bool(identity_chips_html)
 
+    has_quality_scores = "quality_score" in df.columns
+
+    # Load thresholds so the breakdown can show the actual zero_face_cap that
+    # was used to compute the stored quality_score. Falls back to defaults.
+    if cfg is not None:
+        thresholds = Thresholds.load(cfg.output_dir / "score_thresholds.json")
+    else:
+        thresholds = Thresholds(**DEFAULT_THRESHOLDS)
+
+    quality_config = {
+        "weight_face": WEIGHT_FACE,
+        "weight_aesthetic": WEIGHT_AESTHETIC,
+        "weight_area": WEIGHT_AREA,
+        "zero_face_cap": thresholds.zero_face_cap,
+        "thresholds": {
+            "low_medium": thresholds.low_medium,
+            "medium_high": thresholds.medium_high,
+            "high_great": thresholds.high_great,
+        },
+    }
+
     frames_json = json.dumps(frames, separators=(",", ":"), allow_nan=False)
     portraits_json = json.dumps(portraits, separators=(",", ":"))
+    quality_config_json = json.dumps(quality_config, separators=(",", ":"))
     js_source = (
         JS_TEMPLATE
         .replace("__FRAMES_DATA__", frames_json)
         .replace("__IDENTITY_PORTRAITS__", portraits_json)
+        .replace("__QUALITY_CONFIG__", quality_config_json)
     )
 
     source_panel = """
@@ -3060,6 +3523,7 @@ def main() -> None:
     <span class="dropdown-label">Debug</span>
     <label class="settings-toggle"><input type="checkbox" id="toggle-show_debug"><span class="toggle-label">Show debug scores</span><span class="toggle-hint">side panel</span></label>
     <label class="settings-toggle"><input type="checkbox" id="toggle-show_faces"><span class="toggle-label">Show face overlays</span><span class="toggle-hint">bboxes + kps</span></label>
+    <label class="settings-toggle"><input type="checkbox" id="toggle-show_quality"><span class="toggle-label">Quality score breakdown</span><span class="toggle-hint">per-card overlay</span></label>
   </div>
 </div>"""
 
@@ -3067,6 +3531,29 @@ def main() -> None:
         '<button class="dropdown-trigger" data-dropdown="people">People <span class="caret">&#9662;</span></button>'
         if show_people_dropdown else ""
     )
+
+    bucket_chips_html = """
+    <span class="bucket-filter-label">Quality bucket</span>
+    <button class="bucket-chip" data-bucket="all"><span class="bucket-dot"></span>All</button>
+    <button class="bucket-chip" data-bucket="low"><span class="bucket-dot"></span>Low</button>
+    <button class="bucket-chip" data-bucket="medium"><span class="bucket-dot"></span>Medium</button>
+    <button class="bucket-chip" data-bucket="high"><span class="bucket-dot"></span>High</button>
+    <button class="bucket-chip" data-bucket="great"><span class="bucket-dot"></span>Great</button>""" if has_quality_scores else ""
+
+    similar_toggle_html = """
+    <button class="similar-toggle" id="similar-toggle" title="Hide near-duplicate frames">
+      <span class="toggle-icon">&#9678;</span><span class="toggle-label">Hide similar</span>
+    </button>""" if has_similarity_groups else ""
+
+    if has_quality_scores or has_similarity_groups:
+        bucket_filter_row = (
+            '\n  <div class="bucket-filter-row">'
+            f"{bucket_chips_html}"
+            f"{similar_toggle_html}"
+            "\n  </div>"
+        )
+    else:
+        bucket_filter_row = ""
 
     body = f"""<!doctype html>
 <html lang="en">
@@ -3088,6 +3575,7 @@ def main() -> None:
     </div>
     <button id="export-btn">Export (0)</button>
   </div>
+  {bucket_filter_row}
   {source_panel}
   {quality_panel}
   {people_panel}
