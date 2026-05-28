@@ -82,6 +82,11 @@ DIGIT_RE = re.compile(r"\d+")
 
 MAX_IMAGE_LONGEST_SIDE = 1024
 
+# torch.compile is only attempted when we have enough images to amortize its
+# warmup cost. Below this threshold, the warmup pass alone takes longer than
+# the savings it produces.
+COMPILE_MIN_IMAGES = 50
+
 
 def _load_image_capped(path: str) -> tuple[Image.Image, tuple[int, int], tuple[int, int]]:
     """Open an image as RGB and cap its longest side at MAX_IMAGE_LONGEST_SIDE.
@@ -337,6 +342,27 @@ def print_summary(
 # Main
 # ---------------------------------------------------------------------------
 
+def _compile_and_warmup(processor, model, sample_image: Image.Image, batch_size: int):
+    """Compile the model with reduce-overhead mode and run one full-batch warmup.
+
+    Caller is responsible for the size gate (COMPILE_MIN_IMAGES); this just does
+    the work. Returns the compiled wrapper to use for subsequent generate calls.
+    Warms at ``batch_size`` so the common steady-state shape hits the compiled path.
+    """
+    t0 = time.time()
+    print("Compiling model (torch.compile mode=reduce-overhead) + warmup pass...")
+    compiled = torch.compile(model, mode="reduce-overhead")
+    warm_batch = [sample_image] * batch_size
+    for prompt, max_new in (
+        (PROMPT_STRUCTURED, 120),
+        (PROMPT_DESCRIPTION, 120),
+        (PROMPT_AESTHETIC, 8),
+    ):
+        run_prompt_batch(processor, compiled, warm_batch, prompt, max_new)
+    print(f"Warmup complete in {time.time() - t0:.1f}s")
+    return compiled
+
+
 def caption_run(
     cfg: RunConfig,
     min_quality: str,
@@ -344,6 +370,7 @@ def caption_run(
     device: str,
     force: bool,
     max_images: int | None,
+    compile_model: bool,
 ) -> None:
     results_path = cfg.output_dir / "results.parquet"
     if not results_path.exists():
@@ -368,19 +395,44 @@ def caption_run(
         print("Nothing to do.")
         return
 
-    # Overnight reality-check: 2-prompt runs measured ~18s/image, so 3-prompt
-    # runs scale to ~27s/image (3/2 x 18s = 3 prompts x ~9s).
-    est_s = n_to_caption * 3 * 9.0
+    # Benchmark on RTX 2060 (still_extractor/tools/benchmark_captioning.py):
+    # bs=4 -> 0.296 img/s, bs=2 -> 0.281, bs=1 -> 0.268. Use a per-image budget
+    # that loosely tracks batch size, with a floor for very small batches.
+    est_per_image_s = 3.4 if batch_size >= 4 else (3.6 if batch_size >= 2 else 3.7)
+    est_s = n_to_caption * est_per_image_s
     est_m, est_sec = divmod(int(est_s), 60)
     print(f"Estimated runtime: ~{est_m}m {est_sec:02d}s "
-          f"({n_to_caption} images x 3 prompts x ~9s)")
+          f"({n_to_caption} images x ~{est_per_image_s:.1f}s at batch_size={batch_size})")
 
     processor, model = load_model(device)
 
     idx_list = list(selected_idx)
+
+    if compile_model:
+        if n_to_caption < COMPILE_MIN_IMAGES:
+            print(f"--compile requested but only {n_to_caption} images "
+                  f"(< {COMPILE_MIN_IMAGES}); skipping compile.")
+        else:
+            try:
+                warm_path = df.at[idx_list[0], "kept_path"]
+                warm_img, _, _ = _load_image_capped(warm_path)
+                model = _compile_and_warmup(processor, model, warm_img, batch_size)
+                try:
+                    warm_img.close()
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning("Compile/warmup failed (%s); falling back to eager.", e)
+
     n_batches = (n_to_caption + batch_size - 1) // batch_size
     t0 = time.time()
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    # Note: we considered prompt-batched ordering (run all prompt-1s, then all
+    # prompt-2s, then all prompt-3s across the full image set). Benchmarked in
+    # still_extractor/tools/benchmark_captioning.py at this hardware (RTX 2060,
+    # 8 GB) and it was substantially slower than the per-image-batch ordering
+    # below, so we keep the per-batch 3-prompt loop.
 
     pbar = tqdm(total=n_to_caption, desc="captioning", unit="img")
     for b in range(n_batches):
@@ -480,12 +532,18 @@ def main() -> None:
     parser.add_argument("--min-quality", choices=["good", "okay"], default="good",
                         help="Minimum pred_label to caption. 'good' = only good; "
                              "'okay' = good + okay.")
-    parser.add_argument("--batch-size", type=int, default=8,
-                        help="Images per batched forward pass.")
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="Images per batched forward pass. Default 4 (benchmark "
+                             "winner on RTX 2060/8GB; bs=8 thrashes VRAM, bs=2 slower).")
     parser.add_argument("--device", default="auto",
                         help="cuda, cpu, or auto.")
     parser.add_argument("--force", action="store_true",
                         help="Re-caption rows that already have captions.")
+    parser.add_argument("--compile", dest="compile_model", action="store_true",
+                        help=f"Compile model with torch.compile (reduce-overhead). "
+                             f"Only applied when image count >= {COMPILE_MIN_IMAGES}; "
+                             f"warmup cost otherwise dominates. Benchmark on RTX 2060 "
+                             f"showed no speedup, but the flag is available.")
     parser.add_argument("--max-images", type=int, default=None,
                         help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -508,6 +566,7 @@ def main() -> None:
         device=args.device,
         force=args.force,
         max_images=args.max_images,
+        compile_model=args.compile_model,
     )
 
 
