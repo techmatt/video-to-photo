@@ -25,6 +25,7 @@ dependencies = [
     "pyyaml",
     "tqdm",
     "num2words>=0.5.14",
+    "anthropic>=0.104.1",
 ]
 
 # torch/torchvision/torchaudio are pulled from the PyTorch CUDA index below,
